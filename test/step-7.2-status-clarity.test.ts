@@ -14,20 +14,24 @@
 // Evidence class: simulation (the native VMs run the real custodians).
 
 import { describe, it, expect } from "vitest";
-import { copyFile, readdir, readFile, rename, rm } from "node:fs/promises";
+import { copyFile, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runCli } from "../src/cli/cli.js";
 import { proposalConfirmed } from "../src/cli/setup-commands.js";
+import { remedyFor } from "../src/common/remedies.js";
 import { observeStoredSelfTests, repositoryRecords, repositoryStateOf, type FixEvidence, type Observed, type RecordState, type S1Evidence } from "../src/engine/protected-status.js";
-import { confirmedFixSelfTest, confirmedSelfTest, protectedIsolationDecision, reviewBackends, selfTestRecordDigest, storedS1SelfTest } from "../src/engine/protected-config.js";
+import { confirmedFixSelfTest, confirmedSelfTest, heldAcceptanceApplies, protectedIsolationDecision, reviewBackends, selfTestRecordDigest, storedS1SelfTest } from "../src/engine/protected-config.js";
 import { storedFixSelfTest, fixBackendFor } from "../src/engine/fix-confirmation.js";
 import { probeCodex } from "../src/agents/codex/probe.js";
 import { configSectionOf, CustodianGrants } from "../src/custodian/grants.js";
 import { CONFIG_VIEW_RUN, type ConfigSection, type HeldAcceptance, type HeldSelftestConfirmation } from "../src/custodian/protocol.js";
 import type { SelfTestRecord } from "../src/schemas/review.js";
-import type { IsolationDecision } from "../src/agents/codex/isolation.js";
+import { REDUCED_ISOLATION_STATEMENT_SHA256, type IsolationDecision } from "../src/agents/codex/isolation.js";
+import { compatRowFor } from "../src/agents/codex/compat.js";
+import type { CodexProbe } from "../src/agents/codex/probe.js";
+import { fixEvidenceReader } from "../src/cli/status-fix-evidence.js";
 import { backendsFor, type SandboxBackend } from "../src/agents/codex/argv.js";
 import type { Loaded } from "../src/engine/engine-env.js";
 import { supported } from "./helpers/git-fixture.js";
@@ -157,6 +161,82 @@ describe("Step 7.2 — the S1 row against the stored record a protected review u
     expect(configSectionOf({ globalRevision: 1, repository: null, acceptances: [], selftestConfirmations: [{ confirmationId: "x", usable: true }] })).toBeNull();
     // No engineRuntime (a custodian before P3.4C-5): the engine runtime row is missing, as before.
     expect((await rows(section([]))).find((x) => x.record === "engine_runtime")).toMatchObject({ state: "missing" });
+  });
+});
+
+// Review finding #10: the evidence with the review's REAL isolation decision (protectedIsolationDecision over the held
+// acceptances, the current statement digest and the compatibility row), so a lapse counts only where enforcement would
+// rest on the record it names.
+const probeFor = (version = "0.160.0"): CodexProbe => ({ compat: compatRowFor(version, "win32")!, version, installDir: "C:\\codex", userHooksPresent: false }) as unknown as CodexProbe;
+const s1evReal = (s: ConfigSection, stored: (SelfTestRecord | null)[], backends: SandboxBackend[] = ["mxc"], codexVersion = "0.160.0"): Observed<S1Evidence> => {
+  const selfTests = new Map(backends.map((b, i) => [b, stored[i] && confirmedSelfTest(s, stored[i]!) ? stored[i]! : null] as const));
+  return { ok: true, value: { codexVersion, backends, stored: backends.map((b, i) => ({ backend: b, record: stored[i] ?? null })), decision: protectedIsolationDecision(s, probeFor(codexVersion), backends, selfTests) } };
+};
+const realAcceptance = (over: Partial<HeldAcceptance> = {}): HeldAcceptance => acceptance({ statementSha256: REDUCED_ISOLATION_STATEMENT_SHA256, ...over });
+const lapsedOf = (a: HeldAcceptance): HeldAcceptance => ({ ...a, lapsed: true, usable: false, lapsedAtRecoveryId: "rec-1" });
+
+describe("Step 7.2 — review finding #10: a revocation is never masked by a lapse of another record", () => {
+  // Acceptances the review on mxc with Codex 0.160.0 does not rest on (the decision's own rule), and one it does.
+  const inapplicable: [string, HeldAcceptance][] = [
+    ["another backend", realAcceptance({ backend: "elevated" })],
+    ["another Codex version range", realAcceptance({ codexVersionRange: "0.159" })],
+    ["an earlier statement", realAcceptance({ statementSha256: H("f") })],
+    ["one accepted capability only", realAcceptance({ accepted: ["unrestricted_reads"] })],
+  ];
+  const applicable = realAcceptance();
+
+  it("the stored record's revoked confirmation stays revoked beside an unrelated or an applicable lapsed acceptance (setup --resume never restores it)", async () => {
+    const r1 = rec();
+    for (const [what, a] of [...inapplicable, ["the review's own", applicable] as [string, HeldAcceptance]]) {
+      const s = section([conf(r1, { revoked: true, usable: false })], [lapsedOf(a)]);
+      expect(await row(s, "isolation", { s1: s1evReal(s, [r1]) }), what).toMatchObject({ state: "revoked", resumable: false, restore: 'code-parley setup --repo C:\\r --home "C:\\impl"' });
+      expect(repositoryStateOf(await rows(s, { s1: s1evReal(s, [r1]) })), what).toBe("misconfigured");
+    }
+  });
+
+  it("T6 kept: the stored record's own lapsed confirmation is lapsed, also beside another record's revoked one", async () => {
+    const r1 = rec();
+    const s = section([conf(r1, { lapsed: true, usable: false, lapsedAtRecoveryId: "rec-1" }), conf(rec({ selftest_id: "st-other" }), { confirmationId: "c-2", revoked: true, usable: false })]);
+    expect(await row(s, "isolation", { s1: s1evReal(s, [r1]) })).toMatchObject({ state: "lapsed", resumable: true });
+  });
+
+  it("a lapsed acceptance counts as lapsed only if the review could rest on it; an inapplicable one leaves the S1 row unconfirmed", async () => {
+    const stored = rec({ selftest_id: "st-new" });
+    const s = section([conf(rec({ selftest_id: "st-old" }))], [lapsedOf(applicable)]);
+    expect(await row(s, "isolation", { s1: s1evReal(s, [stored]) })).toMatchObject({ state: "lapsed", resumable: true });
+    for (const [what, a] of inapplicable) {
+      const t = section([conf(rec({ selftest_id: "st-old" }))], [lapsedOf(a)]);
+      expect(await row(t, "isolation", { s1: s1evReal(t, [stored]) }), what).toMatchObject({ state: "unconfirmed", reason: "record_changed", resumable: true });
+    }
+    // Another Codex version than the acceptance's range: inapplicable for this review, though the acceptance itself is fine.
+    // (No compatibility row exists for 0.161.0, so the evidence's decision is the refusal any unsupported version gets.)
+    expect(await row(s, "isolation", { s1: s1ev(s, [null], ["mxc"], "0.161.0") })).toMatchObject({ state: "unconfirmed", reason: "record_missing" });
+  });
+
+  it("agreement with the enforcement predicate: a lapsed acceptance reads lapsed exactly when, restored, the review's decision would rest on it", async () => {
+    const stored = rec({ selftest_id: "st-new" });
+    for (const [what, a] of [...inapplicable, ["the review's own", applicable] as [string, HeldAcceptance]]) {
+      const lapsed = section([conf(rec({ selftest_id: "st-old" }))], [lapsedOf(a)]);
+      const restored = section([conf(rec({ selftest_id: "st-old" }))], [a]);
+      const decision = protectedIsolationDecision(restored, probeFor(), ["mxc"], new Map([["mxc", null]]));
+      expect(heldAcceptanceApplies(lapsedOf(a), ["mxc"], "0.160.0"), what).toBe(decision.ok);
+      expect((await row(lapsed, "isolation", { s1: s1evReal(lapsed, [stored]) })).state === "lapsed", what).toBe(decision.ok);
+      // While lapsed the review refuses (CONFIG_LAPSED at the custodian): never in force.
+      expect(protectedIsolationDecision(lapsed, probeFor(), ["mxc"], new Map([["mxc", null]])).ok, what).toBe(false);
+      // Restored, status and the decision agree on in force.
+      expect((await row(restored, "isolation", { s1: s1evReal(restored, [stored]) })).state === "in_force", what).toBe(decision.ok);
+    }
+    // A revoked acceptance never applies.
+    expect(heldAcceptanceApplies({ ...applicable, revoked: true, usable: false }, ["mxc"], "0.160.0")).toBe(false);
+  });
+
+  it("not observed: a lapsed acceptance never masks a revoked S1 confirmation; alone it is lapsed (T6 kept)", async () => {
+    const r1 = rec();
+    const linux: Observed<S1Evidence> = { ok: false, reason: "store_inaccessible", why: "by design", verify: "the implementer: code-parley status --repo /r" };
+    const revoked = section([conf(r1, { revoked: true, usable: false })], [lapsedOf(applicable)]);
+    expect(await row(revoked, "isolation", { s1: linux, platform: "linux" })).toMatchObject({ state: "revoked", resumable: false });
+    expect(await row(section([], [lapsedOf(applicable)]), "isolation", { s1: linux, platform: "linux" })).toMatchObject({ state: "lapsed", resumable: true });
+    expect(await row(section([conf(r1, { lapsed: true, usable: false })], [lapsedOf(applicable)]), "isolation", { s1: linux, platform: "linux" })).toMatchObject({ state: "lapsed" });
   });
 });
 
@@ -301,6 +381,17 @@ describe.skipIf(!supported)("Step 7.2 — observeStoredSelfTests: missing, inacc
     expect((await observeStoredSelfTests(noProbe, { platform: "win32", root: f.repo, on: "implementer", section: broken })).s1).toMatchObject({ ok: false, reason: "probe_failed" });
     // The Linux operator: inaccessible by design.
     expect((await observeStoredSelfTests(f.le, { platform: "linux", root: f.repo, on: "operator", section })).s1).toMatchObject({ ok: false, reason: "store_inaccessible", why: expect.stringContaining("by design") });
+    // Review finding #7: the FIX reader. A readable Codex without a stored cp_fix record is the delegation's own refusal
+    // (a missing record); a Codex executable that cannot be read leaves the record unidentifiable: store_inaccessible.
+    const probe = await probeCodex({ configured: f.codexExe, sourceEnv: process.env, testLauncher: { file: process.execPath, prefixArgs: [f.fakeScript] } });
+    expect(await fixEvidenceReader(f.le)(probe)).toMatchObject({ local: null, why: expect.stringContaining("no stored cp_fix self-test") });
+    const unreadable = (p: CodexProbe): CodexProbe => ({ ...p, launcher: { ...p.launcher, exe: join(f.scratch, "unreadable-codex.exe") } });
+    await expect(fixEvidenceReader(f.le)(unreadable(probe))).rejects.toThrow(/cannot be read to identify it: ENOENT/);
+    const observed = await observeStoredSelfTests(f.le, { platform: "win32", root: f.repo, on: "implementer", section, fix: (p) => fixEvidenceReader(f.le)(unreadable(p)) });
+    expect(observed.fix).toMatchObject({ ok: false, reason: "store_inaccessible", why: expect.stringContaining("cannot be read or identified") });
+    expect(await row(section, "fix_confirmation", { fix: observed.fix })).toMatchObject({ state: "missing" });
+    const withFix = { ...section, selftestConfirmations: [...section.selftestConfirmations, fixConf()] };
+    expect(await row(withFix, "fix_confirmation", { fix: observed.fix })).toMatchObject({ state: "unverified", reason: "store_inaccessible", required: false });
     // T9b through status: a readable store without the record is a missing record (unconfirmed), not inaccessible.
     await removeS1(f);
     expect(rowOf((await statusJson(f)).s, "isolation")).toMatchObject({ state: "unconfirmed", reason: "record_missing" });
@@ -364,6 +455,23 @@ describe.skipIf(!supported)("Step 7.2 — F-S71-2 end to end: status agrees with
       expect(s.repository.state).toBe("ready");
       expect((await cli(f, ["setup", "--resume", "--fix", "--repo", f.repo, "--no-grant"], terminal())).code).toBe(0);
       expect(rowOf(await expectAgreement(f), "fix_confirmation").state).toBe("in_force");
+
+      // Review finding #6: the FIX confirmation is revoked; setup --resume --fix cannot restore it and does not report
+      // success (exit 1, naming what is open); the repository stays ready for reviews. A new setup --fix confirms it anew.
+      const fixId = f.custodian.snapshot().config.selftestConfirmations.filter((c) => c.mode === "FIX" && c.revokedAt === null && c.supersededAt === null).at(-1)!.confirmationId;
+      expect((await cli(f, ["config", "revoke-selftest", "--repo", f.repo, fixId], terminal())).code).toBe(0);
+      s = await expectAgreement(f);
+      expect(rowOf(s, "fix_confirmation")).toMatchObject({ state: "revoked" });
+      expect(s.repository.state).toBe("ready");
+      const fixResumed = await cli(f, ["setup", "--resume", "--fix", "--repo", f.repo, "--no-grant"], terminal());
+      expect(fixResumed.code, fixResumed.out).toBe(1);
+      expect(fixResumed.out).toMatch(/is ready for protected reviews, but the FIX confirmation that --fix asked for is not in force \(REVOKED\).*Delegated fixes stay refused\. Next: /);
+      expect(fixResumed.out).not.toMatch(/is set up for protected runs/);
+      expect(fixResumed.out).not.toMatch(/confirm the stored FIX self-test/);
+      // Without --fix the same state is complete for reviews (FIX stays optional for readiness).
+      expect((await cli(f, ["setup", "--resume", "--repo", f.repo, "--no-grant"], terminal())).code).toBe(0);
+      expect((await cli(f, ["setup", "--fix", "--repo", f.repo, "--no-grant"], terminal())).code).toBe(0);
+      expect(rowOf(await expectAgreement(f), "fix_confirmation").state).toBe("in_force");
     }
 
     // T2: the stored S1 record is gone: setup cannot confirm it and names the self-test to run (nothing recorded).
@@ -400,6 +508,26 @@ describe.skipIf(!supported)("Step 7.2 — F-S71-2 end to end: status agrees with
     s = await expectAgreement(f);
     expect((await enforcement(f)).mode).toBe("S2");
     expect(rowOf(s, "isolation")).toMatchObject({ state: "in_force", detail: expect.stringContaining("reduced isolation (S2)") });
+
+    // Review finding #10 end to end: the stored record's S1 confirmation is revoked while the acceptance holds (S2), then a
+    // restart lapses the acceptance. The row is revoked, not lapsed, and setup --resume never confirms the S1 record again.
+    // (The row is in force by S2, so setup has nothing to confirm: the operator confirms the stored S1 record directly.)
+    const s1Confirmed = await cli(f, ["config", "confirm-selftest", "--repo", f.repo, "--backend", await fixtureBackend(f), "--codex", f.codexExe], terminal());
+    expect(s1Confirmed.code, s1Confirmed.err).toBe(0);
+    expect((await enforcement(f)).mode).toBe("S1");
+    const s1Id = f.custodian.snapshot().config.selftestConfirmations.filter((c) => c.mode === "S1" && c.revokedAt === null && c.supersededAt === null).at(-1)!.confirmationId;
+    expect((await cli(f, ["config", "revoke-selftest", "--repo", f.repo, s1Id], terminal())).code).toBe(0);
+    expect((await enforcement(f)).mode).toBe("S2");
+    expect(rowOf(await expectAgreement(f), "isolation").state).toBe("in_force");
+    f.custodian.simulateRecoveryAfterNewBoot();
+    s = await expectAgreement(f);
+    expect(rowOf(s, "isolation")).toMatchObject({ state: "revoked", detail: expect.stringContaining("was revoked (setup --resume does not restore it)") });
+    const unrevoked = () => f.custodian.snapshot().config.selftestConfirmations.filter((c) => c.mode === "S1" && c.revokedAt === null).length;
+    const beforeResume = unrevoked();
+    const afterRevoke = await cli(f, ["setup", "--resume", "--repo", f.repo, "--no-grant"], terminal());
+    expect(afterRevoke.out).not.toMatch(/confirm the stored S1 self-test/);
+    expect(unrevoked()).toBe(beforeResume);
+    await expectAgreement(f);
   }, 480_000);
 });
 
@@ -426,6 +554,36 @@ describe.skipIf(!supported)("Step 7.2 — Q4: an explicit Codex or backend prote
     expect(JSON.stringify(f.custodian.snapshot().config)).toBe(snap);
     // The approved installation and the review's backend, named explicitly, are accepted.
     expect((await cli(f, ["setup", "--resume", "--repo", f.repo, "--codex", f.codexExe, "--backend", await fixtureBackend(f), "--no-grant"], terminal())).code).toBe(0);
+  }, 240_000);
+
+  it("review finding #4: an explicit --codex protected execution cannot launch is refused before any step records, also without --backend", async () => {
+    const f = await contFixture(okScenario(output({ findings: [] })), { accounts: true });
+    await storeFixtureSelfTest(f);
+    // A first setup: the runtime approval and the configuration would be recorded before the confirmation step.
+    const snap = JSON.stringify(f.custodian.snapshot().config);
+    const missing = join(f.scratch, "no-such-codex.exe");
+    const notNative = join(f.scratch, process.platform === "win32" ? "codex.cmd" : "codex-script");
+    await copyFile(f.fakeScript, notNative);
+    for (const codex of [missing, notNative]) {
+      const args = (await setupArgs(f, false)).map((x) => (x === f.codexExe ? codex : x));
+      const r = await cli(f, ["setup", "--repo", f.repo, ...args], terminal());
+      expect(r.code, r.out + r.err).toBe(1);
+      expect(r.err).toMatch(new RegExp(`--codex ${codex.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} is not a Codex installation protected execution can launch \\(CODEX_NOT_FOUND: .*Nothing was recorded`));
+      expect(r.out).not.toMatch(/Step 1:/);
+      expect(JSON.stringify(f.custodian.snapshot().config)).toBe(snap);
+    }
+    // The same run with the launchable installation records as before.
+    expect((await cli(f, ["setup", "--repo", f.repo, ...(await setupArgs(f, false))], terminal())).code).toBe(0);
+    const set = JSON.stringify(f.custodian.snapshot().config);
+    // After a restart (a lapsed record a re-confirmation would record first) the named installation is still refused up
+    // front — here as not the approved one (T13), the check that precedes the probe — and nothing is recorded.
+    f.custodian.simulateRecoveryAfterNewBoot();
+    const lapsedSnap = JSON.stringify(f.custodian.snapshot().config);
+    expect(lapsedSnap).not.toBe(set);
+    const r = await cli(f, ["setup", "--resume", "--repo", f.repo, "--codex", missing, "--no-grant"], terminal());
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/--codex .* is not the Codex installation the custodian approved .*Nothing was recorded/);
+    expect(JSON.stringify(f.custodian.snapshot().config)).toBe(lapsedSnap);
   }, 240_000);
 });
 
@@ -455,7 +613,12 @@ describe.skipIf(!supported)("Step 7.2 — an operator whose account cannot read 
   it("setup records what the operator can, never loops, and ends 'not verified from this account' with the implementer's command", async () => {
     const f = await contFixture(okScenario(output({ findings: [] })), { accounts: true });
     await storeFixtureSelfTest(f);
-    expect((await cli(f, ["setup", "--repo", f.repo, ...(await setupArgs(f))], terminal())).code).toBe(0);
+    // With a FIX confirmation held where the host's operator CLI accepts the delegation's backend (as in T12).
+    const probe = await probeCodex({ configured: f.codexExe, sourceEnv: process.env, testLauncher: { file: process.execPath, prefixArgs: [f.fakeScript] } });
+    const fixLegs = (backendsFor() as readonly string[]).includes(fixBackendFor(f.custodianPlatform, f.le.cfg.config.codex.windows_sandbox ?? null, probe));
+    if (fixLegs) await rerunFix(f, "fix-selftest-1");
+    const first = await cli(f, ["setup", ...(fixLegs ? ["--fix"] : []), "--repo", f.repo, ...(await setupArgs(f, !fixLegs))], terminal());
+    expect(first.code, first.err).toBe(0);
     // The same custodian state, read as on Linux by the operator account: the implementer's store is inaccessible.
     const linuxOperator = { ...f.operatorHooks!, custodian: { ...f.operatorHooks!.custodian!, platform: "linux" as NodeJS.Platform } };
     const io = { ...terminal(), engineTestHooks: linuxOperator };
@@ -464,6 +627,14 @@ describe.skipIf(!supported)("Step 7.2 — an operator whose account cannot read 
     expect(r.out).toMatch(/Operator configuration is complete; it is NOT verified from this account .*Codex isolation \(S1\).*Verify: the implementer: code-parley status --repo/);
     expect(r.out).toMatch(/UNVERIFIED/);
     expect(r.out).not.toMatch(/Step \d+: confirm/);
+    // Review finding #6: with --fix the FIX confirmation is part of the run; unverifiable from here, it is named in the
+    // same exit 3 (never reported as set up).
+    if (fixLegs) {
+      const rf = await cli(f, ["setup", "--fix", "--repo", f.repo, "--no-grant"], io);
+      expect(rf.code, rf.err + rf.out).toBe(3);
+      expect(rf.out).toMatch(/Operator configuration is complete; it is NOT verified from this account .*Codex isolation \(S1\), FIX confirmation\)/);
+      expect(rf.out).not.toMatch(/is set up for protected runs/);
+    }
   }, 240_000);
 });
 
@@ -502,6 +673,38 @@ describe.skipIf(!supported)("Step 7.2 — O-1: after a refused re-confirmation s
     expect(ok.out).toMatch(/set the repository's protected configuration again/);
     expect(f.custodian.snapshot().config.repositories.length).toBe(versions + 1);
     expect((await statusJson(f)).s.repository.state).toBe("ready");
+  }, 240_000);
+
+  it("review finding #3: a runtime changed in place after a restart cannot be re-confirmed; the refusal names config approve-runtime, which recovers", async () => {
+    const f = await contFixture(okScenario(output({ findings: [] })), { accounts: true });
+    await storeFixtureSelfTest(f);
+    const args = await setupArgs(f);
+    expect((await cli(f, ["setup", "--repo", f.repo, ...args], terminal())).code).toBe(0);
+    // The approved runtime's helper entry changes in place (same path), then a restart of the OS lapses the records.
+    const runtime = args[args.indexOf("--runtime") + 1]!;
+    await writeFile(join(runtime, "dist", "helper", "main.js"), "// synthetic helper entry, changed in place\n");
+    f.custodian.simulateRecoveryAfterNewBoot();
+    expect(rowOf((await statusJson(f)).s, "engine_runtime").state).toBe("lapsed");
+    // The repository's re-confirmation (with the global records that lapsed) is refused at its commit: STALE_CONFIG.
+    const first = await cli(f, ["setup", "--resume", "--repo", f.repo, "--no-grant"], terminal());
+    expect(first.code).toBe(1);
+    expect(first.err).toMatch(/error STALE_CONFIG: the engine runtime changed since this was prepared/);
+    expect(first.err).toMatch(/fix: +approve the runtime again as it is now: the operator runs `\S+ config approve-runtime --repo <path> --runtime /);
+    expect(first.err).not.toMatch(/run the same command again/);
+    // Run again: refused again (on the real custodians the same STALE_CONFIG; the simulated custodian applies part of the
+    // refused commit, so here the runtime's own re-confirmation is refused CONFIG_MISMATCH) — the same remedy either way.
+    const again = await cli(f, ["setup", "--resume", "--repo", f.repo, "--no-grant"], terminal());
+    expect(again.code).toBe(1);
+    expect(again.err).toMatch(/error (STALE_CONFIG|CONFIG_MISMATCH): the engine runtime /);
+    expect(again.err).toMatch(/fix: +approve the runtime again as it is now: the operator runs `\S+ config approve-runtime/);
+    // The named recovery: approve the runtime as it is now, then resume what remains.
+    expect((await cli(f, ["config", "approve-runtime", "--repo", f.repo, "--runtime", runtime, "--runtime-git", SYNTHETIC_RUNTIME_GIT], terminal())).code).toBe(0);
+    expect((await cli(f, ["setup", "--resume", "--repo", f.repo, "--no-grant"], terminal())).code).toBe(0);
+    expect((await statusJson(f)).s.repository.state).toBe("ready");
+    // Other refusals of the same codes keep their remedies.
+    expect(remedyFor("STALE_CONFIG", "win32", "the global configuration records changed since they were read (revision 3, prepared against 2)")!.fix).toMatch(/^run the same command again/);
+    expect(remedyFor("CONFIG_MISMATCH", "win32", "the Codex installation measured now differs from the one held (file id)")!.fix).toMatch(/^approve the new one: the operator runs `code-parley setup --repo <path>`/);
+    expect(remedyFor("CONFIG_MISMATCH", "linux", "the engine runtime measured now differs from the one approved (tree digest)")!.fix).toContain("`/usr/local/sbin/code-parley-operator config approve-runtime --repo <path> --runtime /opt/codeparley/engine/<version> --runtime-git-path /usr/bin/git`");
   }, 240_000);
 });
 

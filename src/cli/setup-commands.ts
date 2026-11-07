@@ -360,18 +360,32 @@ async function explicitSelectionProblem(le: Loaded, a: SetupArgs, root: string, 
   if (codex && pp && !sets && !same(codex, pp.codex_path)) {
     return `--codex ${codex} is not the Codex installation the custodian approved for this repository (${pp.codex_path}); protected reviews and delegated fixes launch only that one. Omit --codex, or name it; another installation is approved by setting the configuration again (${operatorCli()} config set --repo ${root} --codex <codex>)`;
   }
-  if (!backend) return null;
-  let exe: string;
-  try {
-    exe = codex ?? pp?.codex_path ?? (await codexInstallationPath(le, null)).path;
-  } catch (e) {
-    return `--backend ${backend} cannot be checked against the backends protected execution uses: no Codex installation is approved or named (${e instanceof Error ? e.message : String(e)}). Name it with --codex, or omit --backend`;
+  const probeOf = (exe: string) => probeCodex({ configured: exe, sourceEnv: le.env.sourceEnv, testLauncher: le.env.testHooks?.review?.codexLauncher ?? null });
+  let probe: CodexProbe | null = null;
+  if (codex) {
+    // Review finding #4: the named installation must be one protected execution can launch — the execution path's own
+    // probe (a native executable, a supported version, the required exec flags) — before any step records anything.
+    // Otherwise an earlier step (a runtime approval, the configuration) could commit before a later one refuses it.
+    try {
+      probe = await probeOf(codex);
+    } catch (e) {
+      if (!isDomainError(e)) throw e;
+      return `--codex ${codex} is not a Codex installation protected execution can launch (${e.code}: ${e.message}). Omit --codex, or name a supported native Codex executable`;
+    }
   }
-  let probe: CodexProbe;
-  try {
-    probe = await probeCodex({ configured: exe, sourceEnv: le.env.sourceEnv, testLauncher: le.env.testHooks?.review?.codexLauncher ?? null });
-  } catch (e) {
-    return `--backend ${backend} cannot be checked: the Codex installation ${exe} could not be probed (${e instanceof Error ? e.message : String(e)}). Omit --backend, or fix the installation first`;
+  if (!backend) return null;
+  if (!probe) {
+    let exe: string;
+    try {
+      exe = pp?.codex_path ?? (await codexInstallationPath(le, null)).path;
+    } catch (e) {
+      return `--backend ${backend} cannot be checked against the backends protected execution uses: no Codex installation is approved or named (${e instanceof Error ? e.message : String(e)}). Name it with --codex, or omit --backend`;
+    }
+    try {
+      probe = await probeOf(exe);
+    } catch (e) {
+      return `--backend ${backend} cannot be checked: the Codex installation ${exe} could not be probed (${e instanceof Error ? e.message : String(e)}). Omit --backend, or fix the installation first`;
+    }
   }
   const s1 = reviewBackends(process.platform, le.cfg.config.codex.windows_sandbox, probe);
   if (!(s1 as string[]).includes(backend)) return `--backend ${backend} is not a backend a protected review uses with this Codex: ${s1.join(", ")} (the configured windows_sandbox, else the compatibility row's preference). Omit --backend, or name one of these`;
@@ -472,15 +486,22 @@ async function setup(le: Loaded, a: SetupArgs, io: CliIo): Promise<number> {
   const s = await protectedStatus(le, { repositoryRoot: root, fix });
   io.out("");
   renderStatus(s).forEach((l) => io.out(l));
-  if (s.repository?.state === "ready") io.out(`${root} is set up for protected runs. ${n === 0 ? "Nothing needed recording." : ""}`.trim());
+  // Review finding #6: with --fix, the FIX confirmation is part of what this run was asked to set up. It stays optional
+  // for the repository's readiness; it decides only whether this run reports its own work as complete.
+  const fixRow = a.has("--fix") ? s.repository?.records.find((r) => r.record === "fix_confirmation") : undefined;
+  const fixOpen = fixRow && fixRow.state !== "in_force" ? fixRow : undefined;
+  if (s.repository?.state === "ready" && !fixOpen) io.out(`${root} is set up for protected runs. ${n === 0 ? "Nothing needed recording." : ""}`.trim());
   if (s.state === "busy") io.out(BUSY_LIMITATION);
-  if (s.repository?.state === "ready") return 0;
+  if (s.repository?.state === "ready" && !fixOpen) return 0;
   // Step 7.2 (Q1): the operator's own steps are done, but what only the implementer can read is not verified from this
   // account. That is not an authorization failure and not readiness: the implementer's status makes the comparison.
-  const open = s.repository?.records.filter((r) => r.required && r.state !== "in_force") ?? [];
-  if (s.repository?.state === "unknown" && open.length && open.every((r) => r.state === "unverified")) {
+  const open = [...(s.repository?.records.filter((r) => r.required && r.state !== "in_force") ?? []), ...(fixOpen ? [fixOpen] : [])];
+  if ((s.repository?.state === "unknown" || s.repository?.state === "ready") && open.length && open.every((r) => r.state === "unverified")) {
     io.out(`Operator configuration is complete; it is NOT verified from this account that the confirmations cover the implementer's stored self-tests (${open.map((r) => RECORD_LABEL[r.record]).join(", ")}). Verify: ${[...new Set(open.map((r) => r.restore).filter((x): x is string => x !== null))].join("; ")}.`);
     return 3;
+  }
+  if (s.repository?.state === "ready" && fixOpen) {
+    io.out(`${root} is ready for protected reviews, but the FIX confirmation that --fix asked for is not in force (${fixOpen.state.toUpperCase()}): ${fixOpen.detail}. Delegated fixes stay refused.${fixOpen.restore ? ` Next: ${fixOpen.restore}` : ""}`);
   }
   return 1;
 }

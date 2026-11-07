@@ -16,7 +16,7 @@ import { CustodianGrants } from "../custodian/grants.js";
 import { protectedLoopGate, type CustodianTestHooks } from "../custodian/protected-loops.js";
 import { CUSTODIAN_UNAVAILABLE, type ConfigSection, type HeldAcceptance, type HeldRepositoryConfig, type HeldSelftestConfirmation, type RunSection } from "../custodian/protocol.js";
 import type { SandboxBackend } from "../agents/codex/argv.js";
-import { decideIsolation, type IsolationDecision } from "../agents/codex/isolation.js";
+import { acceptanceApplies, decideIsolation, type IsolationDecision } from "../agents/codex/isolation.js";
 import type { CodexProbe } from "../agents/codex/probe.js";
 import { loadSelfTest } from "../agents/codex/selftest.js";
 import { captureRulesConfigDigest } from "../custodian/config-digests.js";
@@ -231,7 +231,12 @@ export function protectedIsolationDecision(section: ConfigSection, probe: CodexP
 
 /** The held acceptances of reduced isolation in force, in the shape the isolation decision reads. */
 export function heldAcceptances(section: ConfigSection): IsolationAcceptance[] {
-  return section.acceptances.filter((a: HeldAcceptance) => a.usable).map((a) => ({
+  return section.acceptances.filter((a: HeldAcceptance) => a.usable).map(acceptanceShape);
+}
+
+/** A held acceptance in the shape the isolation decision reads (its usability is the caller's filter). */
+function acceptanceShape(a: HeldAcceptance): IsolationAcceptance {
+  return {
     acceptance_id: a.acceptanceId,
     accepted: a.accepted.filter((x): x is IsolationAcceptance["accepted"][number] => x === "unrestricted_reads" || x === "advisory_network"),
     backend: a.backend,
@@ -240,7 +245,16 @@ export function heldAcceptances(section: ConfigSection): IsolationAcceptance[] {
     accepted_at: a.recordedAt,
     via: "cli",
     revoked_at: null,
-  }));
+  };
+}
+
+/**
+ * Whether a held acceptance (usable or lapsed; never a revoked one) would apply to a protected review on one of
+ * `backends` with Codex `codexVersion`, by the decision's own rule (`acceptanceApplies`). Display only: `status` uses it
+ * so that only an acceptance the review could rest on decides whether the isolation row is lapsed.
+ */
+export function heldAcceptanceApplies(a: HeldAcceptance, backends: readonly SandboxBackend[], codexVersion: string): boolean {
+  return !a.revoked && backends.some((b) => acceptanceApplies(acceptanceShape(a), b, codexVersion));
 }
 
 /**

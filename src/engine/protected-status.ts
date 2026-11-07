@@ -27,7 +27,7 @@ import type { SandboxBackend } from "../agents/codex/argv.js";
 import type { IsolationDecision } from "../agents/codex/isolation.js";
 import { probeCodex, type CodexProbe } from "../agents/codex/probe.js";
 import type { SelfTestRecord } from "../schemas/review.js";
-import { confirmedFixSelfTest, confirmedSelfTest, namesFixRecord, namesS1Record, protectedIsolationDecision, reviewBackends, storedS1SelfTest, type StoredFixIdentity } from "./protected-config.js";
+import { confirmedFixSelfTest, confirmedSelfTest, heldAcceptanceApplies, namesFixRecord, namesS1Record, protectedIsolationDecision, reviewBackends, storedS1SelfTest, type StoredFixIdentity } from "./protected-config.js";
 
 /** The host's state, most decisive first. Every value is backed by an observation (see {@link hostStateOf}). */
 export type HostState =
@@ -389,7 +389,7 @@ export async function observeStoredSelfTests(le: Loaded, o: { platform: NodeJS.P
       path.fix_backend = value.backend;
       fix = { ok: true, value };
     } catch (e) {
-      fix = notObserved("store_inaccessible", `the stored FIX self-test cannot be read (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`, implementerStatus);
+      fix = notObserved("store_inaccessible", `the stored FIX self-test cannot be read or identified (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`, implementerStatus);
     }
   }
   return { s1, fix, path };
@@ -519,11 +519,15 @@ export async function repositoryRecords(o: {
       if (d.ok) {
         // Explicitly accepted reduced isolation (S2): the review would run with it; S1 is named beside it.
         out.push({ record: "isolation", state: "in_force", required: true, detail: `reduced isolation (S2): the operator's acceptance ${d.isolation.acceptance_id} for ${d.isolation.backend}; S1 is not established (${s1Why})`, restore: null, resumable: false });
-      } else if (recs.some((x) => s1.some((c) => c.lapsed && namesS1Record(c, x.record))) || acc.some((a) => a.lapsed)) {
+      } else if (recs.some((x) => s1.some((c) => c.lapsed && namesS1Record(c, x.record)))) {
+        // This record's own (unrevoked) confirmation lapsed: --resume re-confirms it.
         out.push(lapsedRow());
       } else if (recs.some((x) => revokedS1.some((c) => namesS1Record(c, x.record)))) {
-        // The operator revoked the confirmation of THIS record: never restored by --resume.
+        // The operator revoked the confirmation of THIS record: never restored by --resume, whatever else lapsed.
         out.push({ record: "isolation", state: "revoked", required: true, detail: `the confirmation of the stored S1 self-test ${recs.find((x) => revokedS1.some((c) => namesS1Record(c, x.record)))!.record.selftest_id} was revoked (setup --resume does not restore it)`, restore: confirmCmd(false, false, null), resumable: false });
+      } else if (acc.some((a) => a.lapsed && heldAcceptanceApplies(a, backends, codexVersion))) {
+        // A lapsed acceptance the review could rest on (the decision's own rule); an inapplicable one decides nothing.
+        out.push(lapsedRow());
       } else if (usableOrLapsed.length || acc.length) {
         // A historical confirmation exists, but not for the record a protected review would use (F-S71-2).
         out.push({ record: "isolation", state: "unconfirmed", required: true, detail: `${usableOrLapsed.some((c) => c.usable) ? "a usable S1 confirmation is held, but " : ""}${s1Why}: a protected review is refused (CODEX_ISOLATION_UNAVAILABLE) until the operator confirms the stored one`, restore: confirmCmd(false, true, reason === "record_changed" ? null : (backends[0] ?? "")), resumable: true, reason });
@@ -535,7 +539,9 @@ export async function repositoryRecords(o: {
     out.push({ record: "isolation", state: "in_force", required: true, detail: `reduced isolation (S2): the operator's acceptance ${ev.s2.acceptanceId} for ${ev.s2.backend}; whether a confirmed S1 self-test applies was not compared (${ev.why})`, restore: null, resumable: false });
   } else if (s1.some((c) => c.usable) || acc.some((a) => a.usable)) {
     out.push(notObservedRow("isolation", true, ev));
-  } else if (s1.some((c) => c.lapsed) || acc.some((a) => a.lapsed)) {
+  } else if (s1.some((c) => c.lapsed) || (!revokedS1.length && acc.some((a) => a.lapsed))) {
+    // Not observed, so which record or backend a lapse concerns is unknown: an unrevoked S1 confirmation that lapsed is
+    // resumable; a lapsed acceptance counts only when no S1 confirmation was revoked (a revocation is never masked).
     out.push(lapsedRow());
   } else if (revokedS1.length || section.acceptances.some((a) => a.revoked)) {
     out.push({ record: "isolation", state: "revoked", required: true, detail: "every S1 self-test confirmation (or acceptance) was revoked (setup --resume does not restore it)", restore: isolationRestore(false, false), resumable: false });

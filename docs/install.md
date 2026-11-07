@@ -589,7 +589,9 @@ selects. An older confirmation does not make a newer self-test current.
   The detail says which case it is. `setup --resume` offers the confirmation; for a missing or
   failed record the implementer runs `code-parley codex selftest` (or `fix-selftest`) first.
 - **`UNVERIFIED`**: this account cannot read the implementer's stored self-tests, so nothing is
-  claimed either way. The repository then reads `UNKNOWN`. On Linux the operator account never can,
+  claimed either way. When the unverified row is a required one (S1) and no other required row is
+  wrong, the repository reads `UNKNOWN`. An unverified FIX row alone does not change the repository's
+  state, because FIX is optional. On Linux the operator account never can,
   by design: the implementer's own `code-parley status --repo <path>` makes the comparison. On
   Windows, the operator adds `--home <the implementer's data home>`.
 - **`REVOKED`**: the operator revoked that confirmation. `setup --resume` does not restore it;
@@ -604,9 +606,17 @@ reinstalled with the same bytes), `setup` does not repeat it. In the same run it
 configuration again. The custodian renders that record and it needs its own typed confirmation. On
 Linux it needs the implementer's `config propose` file.
 
-`setup` refuses `--codex` or `--backend` values that protected execution would not use: another
+`setup` refuses `--codex` or `--backend` values that protected execution would not use: an
+installation it cannot launch (not found, not a native executable, an unsupported version), another
 installation than the approved one, or a backend the review or the fix does not select. Nothing is
-recorded in that case.
+recorded in that case. One exception: when this run sets the repository's configuration (it is
+missing, changed or revoked), `--codex` names the installation to approve. The custodian renders it,
+and your typed confirmation records it.
+
+With `--fix`, `setup` reports its own work as complete only when the FIX confirmation is in force. If
+FIX could not be verified from this account, it exits with code 3. If FIX is still missing or
+unconfirmed, it exits 1 and names the next command, even though the repository may already be ready
+for protected reviews.
 
 ## Manual review (any platform)
 
