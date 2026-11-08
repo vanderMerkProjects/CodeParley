@@ -278,17 +278,21 @@ describe.skipIf(!supported)("lock show / release (MR-C)", () => {
   const failing = async (): Promise<never> => {
     throw new Error("WMI query failed");
   };
-  const empty = async (): Promise<[]> => [];
+  // A readable table lists at least this process (the CLI runs in it); nothing else is running.
+  const readable = async () => [{ pid: process.pid, ppid: process.ppid, createdMs: Date.now() - 60_000, name: "node" }];
+  // Linux: an empty or hidden /proc reads as an empty list; a table without this process is no view of the table.
+  const emptyList = async (): Promise<[]> => [];
+  const withoutSelf = async () => [{ pid: process.pid + 100_000, ppid: 1, createdMs: 1, name: "init" }];
   const cliSnap = (f: Fixture, snapshot: () => Promise<unknown>, args: string[], prompt: ((q: string) => Promise<string>) | null = null) => {
     const io = { ...captureIo(), prompt, engineTestHooks: { checks: { sweep: { snapshot: snapshot as never } } } };
     return runCli([...args, "--repo", f.repo, "--home", f.dataHome, "--git", f.git], io).then((code) => ({ code, out: io.lines.join("\n"), err: io.errors.join("\n") }));
   };
 
-  it("F-N26-1: an unavailable or failing process table refuses the release without --force, and the lock stays exactly as it was", async () => {
+  it("F-N26-1: an unavailable, failing, empty or self-less process table refuses the release without --force, and the lock stays exactly as it was", async () => {
     const f = await makeFixture();
     const p = await plantLock(f, {}); // a dead owner, ownership unresolved, no recorded child: nothing listed as running
     const before = await readFile(p, "utf8");
-    for (const snap of [unavailable, failing]) {
+    for (const snap of [unavailable, failing, emptyList, withoutSelf]) {
       const r = await cliSnap(f, snap, ["lock", "release", "--confirm", OP]);
       expect(r.code).toBe(1);
       expect(r.out).toContain("(the process table could not be read; descendants were not checked)");
@@ -333,10 +337,10 @@ describe.skipIf(!supported)("lock show / release (MR-C)", () => {
   it("F-N26-1: a readable process table with nothing running releases as before (confirmation required, no warning)", async () => {
     const f = await makeFixture();
     const p = await plantLock(f, {});
-    const wrong = await cliSnap(f, empty, ["lock", "release", "--confirm", "0199bbbb"]);
+    const wrong = await cliSnap(f, readable, ["lock", "release", "--confirm", "0199bbbb"]);
     expect(wrong.code).toBe(2);
     expect(await readWorktreeLock(p)).not.toBeNull();
-    const rel = await cliSnap(f, empty, ["lock", "release", "--confirm", OP]);
+    const rel = await cliSnap(f, readable, ["lock", "release", "--confirm", OP]);
     expect(rel.code).toBe(0);
     expect(rel.out).not.toContain("the process table could not be read");
     expect(rel.err).toBe("");

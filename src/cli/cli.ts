@@ -481,10 +481,14 @@ interface LockInspection {
 
 /** The process-table snapshot `lock show` / `lock release` use. TEST ONLY: `engineTestHooks.checks.sweep.snapshot`
  * scripts it (never set by the CLI's entry point, a flag, configuration or the environment). A snapshot that throws is
- * unavailable, like one that returns null (F-N26-1). */
+ * unavailable, like one that returns null (F-N26-1), and so is one that does not list this very process: it is no view
+ * of the process table (Linux: an empty or hidden /proc reads as an empty list, not as a failure). */
 function lockSnapshot(io: CliIo): () => Promise<ProcEntry[] | null> {
   const snap = io.engineTestHooks?.checks?.sweep?.snapshot ?? snapshotProcessTable;
-  return () => snap().catch(() => null);
+  return async () => {
+    const table = await snap().catch(() => null);
+    return table && table.some((e) => e.pid === process.pid) ? table : null;
+  };
 }
 
 async function inspectLock(lock: WorktreeLockInfo, snapshot: () => Promise<ProcEntry[] | null>): Promise<LockInspection> {
