@@ -35,7 +35,8 @@ import { selfOwner, classifyOwnerLiveness, OWNER_LIVENESS_DEPS } from "../store/
 import { clearWorktreeOwnership, readWorktreeLock, type WorktreeLockInfo } from "../store/locks.js";
 import { resolveNativeExecutable } from "../process/native-resolve.js";
 import { describeKind, resolveCommand, displayCommandLine, printable } from "../process/command.js";
-import { snapshotProcessTable, findDescendants } from "../process/proc-table.js";
+import { snapshotProcessTable, findDescendants, type ProcEntry } from "../process/proc-table.js";
+import { lockReleaseDecision } from "./lock-release-decision.js";
 import { buildChildEnv, lookupEnv } from "../process/env.js";
 import { ticksOfIdentity } from "../process/linux-proc.js";
 import { canonicalizePath, pathKey } from "../workspace/paths.js";
@@ -478,14 +479,22 @@ interface LockInspection {
   scanOk: boolean;
 }
 
-async function inspectLock(lock: WorktreeLockInfo): Promise<LockInspection> {
+/** The process-table snapshot `lock show` / `lock release` use. TEST ONLY: `engineTestHooks.checks.sweep.snapshot`
+ * scripts it (never set by the CLI's entry point, a flag, configuration or the environment). A snapshot that throws is
+ * unavailable, like one that returns null (F-N26-1). */
+function lockSnapshot(io: CliIo): () => Promise<ProcEntry[] | null> {
+  const snap = io.engineTestHooks?.checks?.sweep?.snapshot ?? snapshotProcessTable;
+  return () => snap().catch(() => null);
+}
+
+async function inspectLock(lock: WorktreeLockInfo, snapshot: () => Promise<ProcEntry[] | null>): Promise<LockInspection> {
   const ownerLiveness = await classifyOwnerLiveness(lock.owner, OWNER_LIVENESS_DEPS);
   const liveChildren: LockInspection["liveChildren"] = [];
   for (const c of lock.children ?? []) {
     const l = await classifyOwnerLiveness({ serverInstanceId: "child", pid: c.pid, startedAtMs: c.startedAtMs, ...(c.startIdentity ? { startIdentity: c.startIdentity } : {}) }, { ...OWNER_LIVENESS_DEPS, toleranceMs: 3000 });
     if (l !== "dead") liveChildren.push({ pid: c.pid, command_line: c.command_line });
   }
-  const table = await snapshotProcessTable();
+  const table = await snapshot();
   const descendants: LockInspection["descendants"] = [];
   if (table) {
     for (const c of lock.children ?? []) {
@@ -518,7 +527,7 @@ async function lockShow(p: Parsed, io: CliIo): Promise<number> {
     io.out(`no worktree lock for ${rc.repoRoot}`);
     return 0;
   }
-  printInspection(io, await inspectLock(lock));
+  printInspection(io, await inspectLock(lock, lockSnapshot(io)));
   return 0;
 }
 
@@ -530,16 +539,21 @@ async function lockRelease(p: Parsed, io: CliIo): Promise<number> {
     io.out(`no worktree lock for ${rc.repoRoot}`);
     return 0;
   }
-  const x = await inspectLock(lock);
+  const x = await inspectLock(lock, lockSnapshot(io));
   printInspection(io, x);
-  if (!lock.ownership_unresolved && x.ownerLiveness !== "dead") {
-    io.err("the lock is held by a live (or unconfirmed) owner; it is not released. Stop that operation instead.");
+  const decision = lockReleaseDecision({
+    ownershipUnresolved: lock.ownership_unresolved === true,
+    ownerLiveness: x.ownerLiveness,
+    liveChildren: x.liveChildren.length,
+    descendants: x.descendants.length,
+    scanOk: x.scanOk,
+    force: has(p, "--force"),
+  });
+  if (!decision.proceed) {
+    io.err(decision.message);
     return 1;
   }
-  if ((x.liveChildren.length > 0 || x.descendants.length > 0) && !has(p, "--force")) {
-    io.err("processes started by the check are still running; end them first, or pass --force to release anyway");
-    return 1;
-  }
+  for (const w of decision.warnings) io.err(w);
   let ok = confirmMatches(one(p, "--confirm")?.replace(/-/g, ""), lock.operation_id.replace(/-/g, ""));
   if (!ok && io.prompt) ok = (await io.prompt(`Type the operation id (${lock.operation_id}) to release: `)).trim() === lock.operation_id;
   if (!ok) {

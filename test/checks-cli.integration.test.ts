@@ -270,4 +270,98 @@ describe.skipIf(!supported)("lock show / release (MR-C)", () => {
       process.kill(gc);
     }
   }, 60_000);
+
+  // F-N26-1: a process table that cannot be read is no evidence that nothing the check started still runs.
+  // The snapshot is scripted through the CLI's test-only hook (engineTestHooks.checks.sweep.snapshot).
+  const OP = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0000";
+  const unavailable = async (): Promise<null> => null;
+  const failing = async (): Promise<never> => {
+    throw new Error("WMI query failed");
+  };
+  const empty = async (): Promise<[]> => [];
+  const cliSnap = (f: Fixture, snapshot: () => Promise<unknown>, args: string[], prompt: ((q: string) => Promise<string>) | null = null) => {
+    const io = { ...captureIo(), prompt, engineTestHooks: { checks: { sweep: { snapshot: snapshot as never } } } };
+    return runCli([...args, "--repo", f.repo, "--home", f.dataHome, "--git", f.git], io).then((code) => ({ code, out: io.lines.join("\n"), err: io.errors.join("\n") }));
+  };
+
+  it("F-N26-1: an unavailable or failing process table refuses the release without --force, and the lock stays exactly as it was", async () => {
+    const f = await makeFixture();
+    const p = await plantLock(f, {}); // a dead owner, ownership unresolved, no recorded child: nothing listed as running
+    const before = await readFile(p, "utf8");
+    for (const snap of [unavailable, failing]) {
+      const r = await cliSnap(f, snap, ["lock", "release", "--confirm", OP]);
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("(the process table could not be read; descendants were not checked)");
+      expect(r.err).toMatch(/could not be verified as ended; the lock was not released/);
+      expect(r.err).toMatch(/--force/);
+      expect(r.out).not.toMatch(/released the worktree lock/);
+      expect(await readFile(p, "utf8")).toBe(before);
+    }
+  }, 60_000);
+
+  it("F-N26-1: with --force an unverifiable process table is released only after the typed confirmation, with a warning", async () => {
+    const f = await makeFixture();
+    const p = await plantLock(f, {});
+    const before = await readFile(p, "utf8");
+    const noConfirm = await cliSnap(f, unavailable, ["lock", "release", "--force"]);
+    expect(noConfirm.code).toBe(2);
+    expect(noConfirm.err).toMatch(/WARNING: --force: the process table could not be read/);
+    expect(await readFile(p, "utf8")).toBe(before);
+    const wrong = await cliSnap(f, unavailable, ["lock", "release", "--force", "--confirm", "0199bbbb"]);
+    expect(wrong.code).toBe(2);
+    expect(await readFile(p, "utf8")).toBe(before);
+    const declined = await cliSnap(f, unavailable, ["lock", "release", "--force"], async () => "no");
+    expect(declined.code).toBe(2);
+    expect(await readFile(p, "utf8")).toBe(before);
+    const rel = await cliSnap(f, failing, ["lock", "release", "--force", "--confirm", OP]);
+    expect(rel.code).toBe(0);
+    expect(rel.err).toMatch(/WARNING: --force: the process table could not be read/);
+    expect(rel.out).toContain(`released the worktree lock of operation ${OP}`);
+    expect(await readWorktreeLock(p)).toBeNull();
+  }, 60_000);
+
+  it("F-N26-1: --force never releases a live owner's lock, also with an unverifiable process table", async () => {
+    const f = await makeFixture();
+    const p = await plantLock(f, { owner: selfOwner(), ownership_unresolved: false });
+    const before = await readFile(p, "utf8");
+    const r = await cliSnap(f, unavailable, ["lock", "release", "--force", "--confirm", OP]);
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/live \(or unconfirmed\) owner/);
+    expect(await readFile(p, "utf8")).toBe(before);
+  }, 60_000);
+
+  it("F-N26-1: a readable process table with nothing running releases as before (confirmation required, no warning)", async () => {
+    const f = await makeFixture();
+    const p = await plantLock(f, {});
+    const wrong = await cliSnap(f, empty, ["lock", "release", "--confirm", "0199bbbb"]);
+    expect(wrong.code).toBe(2);
+    expect(await readWorktreeLock(p)).not.toBeNull();
+    const rel = await cliSnap(f, empty, ["lock", "release", "--confirm", OP]);
+    expect(rel.code).toBe(0);
+    expect(rel.out).not.toContain("the process table could not be read");
+    expect(rel.err).toBe("");
+    expect(await readWorktreeLock(p)).toBeNull();
+  }, 60_000);
+
+  it("F-N26-1: lock show stays read-only and reports that descendants were not checked", async () => {
+    const f = await makeFixture();
+    const p = await plantLock(f, {});
+    const before = await readFile(p, "utf8");
+    const r = await cliSnap(f, failing, ["lock", "show"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("(the process table could not be read; descendants were not checked)");
+    expect(await readFile(p, "utf8")).toBe(before);
+  }, 60_000);
+
+  it("F-N26-1: a lock that changes during the confirmation is not released, also with --force", async () => {
+    const f = await makeFixture();
+    const p = await plantLock(f, {});
+    const r = await cliSnap(f, unavailable, ["lock", "release", "--force"], async () => {
+      await plantLock(f, { operation_id: "0199cccc-dddd-7eee-8fff-000011112222" }); // another operation took the worktree
+      return OP;
+    });
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/the lock changed while it was being inspected; nothing was released/);
+    expect((await readWorktreeLock(p))?.operation_id).toBe("0199cccc-dddd-7eee-8fff-000011112222");
+  }, 60_000);
 });
