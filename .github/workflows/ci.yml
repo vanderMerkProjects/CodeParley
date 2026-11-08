@@ -8,10 +8,12 @@
 name: CI
 
 # When it runs (plan M1.6-7): pull requests, pushes to main and manual runs (Actions tab or
-# `gh workflow run CI --ref <branch> [-f expected_sha=<sha>]`); plain branch pushes and documentation-only changes do
-# not start it. What runs is the same for every event: the one supported Node.js major (package.json engines, the
-# single-runtime policy; test/ci-workflow.test.ts keeps the matrix on it) on Windows and Linux, each platform as one
-# verify job and the test job's shards, which together run the whole suite (Step 6): its result is all of those jobs'.
+# `gh workflow run CI --ref <branch> [-f expected_sha=<sha>]`); plain branch pushes and documentation-only pushes to
+# main do not start it. Every pull request runs it, documentation-only ones included: main's ruleset requires these
+# checks on every pull request, and a skipped run never reports them. What runs is the same for every event: the one
+# supported Node.js major (package.json engines, the single-runtime policy; test/ci-workflow.test.ts keeps the matrix
+# on it) on Windows and Linux, each platform as one verify job and the test job's shards, which together run the whole
+# suite (Step 6): its result is all of those jobs'.
 # Releases are tagged on main, so the release gate is the push run of the tagged commit (or of the last earlier commit
 # that changed more than documentation).
 on:
@@ -22,7 +24,6 @@ on:
     # at run time and the tests render.
     paths-ignore: ["*.md", "*.MD", "docs/**", "spike/**/*.md"]
   pull_request:
-    paths-ignore: ["*.md", "*.MD", "docs/**", "spike/**/*.md"]
   workflow_dispatch:
     inputs:
       expected_sha:
