@@ -51,7 +51,7 @@ export interface FixSummary {
   proposal_id: string;
   status: string;
   proposal: { proposal_digest: string; change_count: number; total_bytes: number; expires_at: string; retired: string | null; changes: { path: string; kind: string }[] } | null;
-  owner_decision: { decision: string; expires_at: string | null; consumed_by: string | null } | null;
+  owner_decision: { decision: string; expires_at: string | null; consumed_by: string | null; withdrawn_at: string | null } | null;
   violations: { kind: string; path: string | null }[];
   applications: { apply_operation_id: string; status: string }[];
 }
@@ -76,7 +76,7 @@ export async function fixesOf(le: Loaded, run: RunHandle): Promise<FixSummary[] 
             changes: ((p["changes"] ?? []) as Record<string, unknown>[]).map((x) => ({ path: String(x["path"]), kind: String(x["kind"]) })),
           }
         : null,
-      owner_decision: c ? { decision: String(c["decision"]), expires_at: typeof c["expiresAt"] === "string" ? c["expiresAt"] : null, consumed_by: typeof c["consumedBy"] === "string" ? c["consumedBy"] : null } : null,
+      owner_decision: c ? { decision: String(c["decision"]), expires_at: typeof c["expiresAt"] === "string" ? c["expiresAt"] : null, consumed_by: typeof c["consumedBy"] === "string" ? c["consumedBy"] : null, withdrawn_at: typeof c["withdrawnAt"] === "string" ? c["withdrawnAt"] : null } : null,
       violations: ((outcome?.["violations"] ?? []) as { kind: string; path: string | null }[]).slice(0, 20),
       applications: applies.filter((a) => (a["begin"] as Record<string, unknown>)["fixOperationId"] === id).map((a) => ({ apply_operation_id: String(a["operationId"]), status: String(a["status"]) })),
     };

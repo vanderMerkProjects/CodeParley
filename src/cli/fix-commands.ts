@@ -12,6 +12,9 @@
 //                                      (operator, interactive) confirm EXACTLY the rendered content, single use
 //   fix reject <run-id> <proposal> --repo <path>
 //                                      (operator, interactive) close the proposal; nothing is applied
+//   fix withdraw <run-id> <proposal> --repo <path>
+//                                      (operator, interactive; POST-1) withdraw a confirmed fix's confirmation before it is
+//                                      applied: it can never be applied (fix-withdraw.ts)
 //   fix reconcile <run> [--restore | --leave]
 //                                      (implementer) an interrupted application: each journaled file's state; with a
 //                                      choice, restore the files still at their postimage or leave them, record it with
@@ -36,6 +39,7 @@ import { commitFixDecision, prepareFixDecision } from "../engine/fix-decision.js
 import { fixRenderingOf, fixRunSectionOf, type FixRunRef } from "../engine/fix-view.js";
 import { repoRoot } from "./loop-commands.js";
 import { runFixReview } from "./fix-review.js";
+import { runFixWithdraw } from "./fix-withdraw.js";
 import { selfOwner } from "../store/owner.js";
 import type { CliIo } from "./cli.js";
 
@@ -53,7 +57,7 @@ const NOT_ELEVATED = process.platform === "linux"
   ? "The CodeParley custodian accepts a delegated fix's confirmation only on its operator socket, from the operator account: run this command as the operator account through /usr/local/sbin/code-parley-operator. Nothing was recorded."
   : "The CodeParley custodian accepts a delegated fix's confirmation only from the operator surface with an elevated operator token: run this command in an elevated terminal (Run as administrator) as the operator account. Nothing was recorded.";
 
-const USAGE = "usage: code-parley fix (review [--repo <path>] [--no-pager] | show <run> [<proposal>] [--repo <path>] | confirm <run-id> <proposal> --repo <path> | reject <run-id> <proposal> --repo <path> | reconcile <run> [--restore | --leave])";
+const USAGE = "usage: code-parley fix (review [--repo <path>] [--no-pager] | show <run> [<proposal>] [--repo <path>] | confirm <run-id> <proposal> --repo <path> | reject <run-id> <proposal> --repo <path> | withdraw <run-id> <proposal> --repo <path> | reconcile <run> [--restore | --leave])";
 
 export async function runFixCli(a: FixArgs, io: CliIo): Promise<number> {
   const launch = {
@@ -76,7 +80,18 @@ export async function runFixCli(a: FixArgs, io: CliIo): Promise<number> {
       throw e;
     }
   }
-  if (!a.refs[0] || !["show", "confirm", "reject", "reconcile"].includes(a.cmd ?? "")) throw new DomainError("INVALID_ARGUMENT", USAGE);
+  if (!a.refs[0] || !["show", "confirm", "reject", "withdraw", "reconcile"].includes(a.cmd ?? "")) throw new DomainError("INVALID_ARGUMENT", USAGE);
+  // POST-1 Fix Withdraw: the operator's channel, like confirm and reject (no engine, no data home).
+  if (a.cmd === "withdraw") {
+    const gate = protectedLoopGate(io.engineTestHooks?.custodian);
+    if (!gate.available) throw gate.error;
+    try {
+      return await runFixWithdraw(gate.transport, io, a.refs, a.one("--repo"));
+    } catch (e) {
+      if (isDomainError(e) && e.code === "CALLER_NOT_AUTHORIZED") throw new DomainError("CALLER_NOT_AUTHORIZED", `${NOT_ELEVATED} (${e.message})`);
+      throw e;
+    }
+  }
   // confirm/reject are the operator's channel (the operator surface): no engine and no data home (G-OP).
   if (a.cmd === "confirm" || a.cmd === "reject") {
     try {
@@ -101,7 +116,7 @@ export async function runFixCli(a: FixArgs, io: CliIo): Promise<number> {
 async function show(le: Loaded, run: FixRunRef, proposal: string | null, io: CliIo): Promise<number> {
   if (proposal) {
     const r = await fixRenderingOf(le, run, proposal);
-    io.out(`delegated fix ${r.operationId}: ${r.status}${r.confirmation ? ` (owner ${r.confirmation.decision === "confirm" ? "confirmed" : "rejected"}${r.confirmation.consumedAt ? `, applied from at ${r.confirmation.consumedAt}` : r.confirmation.expiresAt ? `, confirmation expires ${r.confirmation.expiresAt}` : ""})` : ""}`);
+    io.out(`delegated fix ${r.operationId}: ${r.status}${r.confirmation ? ` (owner ${r.confirmation.decision === "confirm" ? "confirmed" : "rejected"}${r.confirmation.withdrawnAt ? `, withdrawn at ${r.confirmation.withdrawnAt}` : r.confirmation.consumedAt ? `, applied from at ${r.confirmation.consumedAt}` : r.confirmation.expiresAt ? `, confirmation expires ${r.confirmation.expiresAt}` : ""})` : ""}`);
     io.out("The custodian's rendering (verbatim):");
     for (const line of r.rendering.replace(/\n$/, "").split("\n")) io.out(line);
     return 0;
@@ -118,7 +133,7 @@ async function show(le: Loaded, run: FixRunRef, proposal: string | null, io: Cli
       ? `fix ${String(o["operationId"])}: ${String(o["status"])}${p ? `; proposal ${String(p["proposalDigest"]).slice(0, 16)}…, ${String(p["changeCount"])} file(s), ${String(p["totalBytes"])} bytes, expires ${String(p["expiresAt"])}${p["retiredAt"] ? `, retired (${String(p["retiredReason"])})` : ""}` : ""}`
       : `  application ${String(o["operationId"])} of ${String((o["begin"] as Record<string, unknown>)["fixOperationId"])}: ${String(o["status"])}`);
   }
-  io.out(`show one: code-parley fix show ${run.runId} <proposal>; decide: code-parley fix confirm|reject ${run.runId} <proposal> --repo ${run.meta.repository_root} (operator)`);
+  io.out(`show one: code-parley fix show ${run.runId} <proposal>; decide: code-parley fix confirm|reject ${run.runId} <proposal> --repo ${run.meta.repository_root}; withdraw a confirmed one: code-parley fix withdraw ${run.runId} <proposal> --repo ${run.meta.repository_root} (operator)`);
   return 0;
 }
 

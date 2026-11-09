@@ -175,6 +175,7 @@ export const USAGE = [
   "  fix show       <run-id> [<proposal>] [--repo <path>]   (a delegated fix: the custodian's exact rendering of its proposal; with --repo, the run as the custodian holds it)",
   "  fix confirm    <run-id> <proposal> --repo <path>   (confirm exactly the rendered content, single use; operator, interactive)",
   "  fix reject     <run-id> <proposal> --repo <path>   (close the proposal; operator, interactive)",
+  "  fix withdraw   <run-id> <proposal> --repo <path>   (withdraw a confirmed fix's confirmation before it is applied: it can never be applied; operator, interactive)",
   "  fix reconcile  <run-id> [--restore | --leave]   (an interrupted application: report, then restore or leave and record it)",
   "  global options: --home <data dir>  --git <git executable>  --config <file>",
   "  exit codes: 0 ok, 1 error, 2 confirmation required, 3 cancellation requested but termination not confirmed, 4 the stop did not establish that no confirmed fix can run",

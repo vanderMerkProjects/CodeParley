@@ -46,6 +46,8 @@ export type CustodianOp =
   | "prepare_fix_decision" | "render_fix_proposal"
   // Step 7.1: the operator's listing of the delegated fixes the custodian holds (operator only).
   | "list_fix_proposals"
+  // POST-1 Fix Withdraw: the withdrawal of one confirmed, unconsumed fix (operator only; committed by `commit`).
+  | "prepare_fix_withdrawal"
   // Phase 5 F-i2-5: the bytes of a baseline capture or response disclosure record the run binds by digest (implementer).
   | "hold_evidence";
 
@@ -632,6 +634,8 @@ export const RUN_REFUSAL_CODES = [
   // custodian's measurement before an application, when it did not succeed (nothing was applied).
   "CONFIRMATION_CONTENT_MISMATCH", "PROPOSAL_NOT_PENDING", "FIX_NOT_CONFIRMED", "FIX_DECLINED", "CONFIRMATION_EXPIRED", "CONFIRMATION_CONSUMED",
   "APPLY_IN_PROGRESS", "FIX_STALE", "MEASUREMENT_FAILED", "MEASUREMENT_TIMEOUT", "MEASUREMENT_CANCELLED",
+  // POST-1 Fix Withdraw: the owner withdrew the fix's confirmation; it can never be applied.
+  "CONFIRMATION_WITHDRAWN",
 ] as const;
 export type RunRefusalCode = (typeof RUN_REFUSAL_CODES)[number];
 
@@ -681,6 +685,8 @@ const ENGINE_CODES: ReadonlySet<string> = new Set<ErrorCode>([
   "APPLY_IN_PROGRESS", "FIX_STALE", "MEASUREMENT_FAILED", "MEASUREMENT_TIMEOUT", "MEASUREMENT_CANCELLED",
   // Step 7.1: a guided selection that no longer matches the custodian's evidence.
   "SELECTION_STALE",
+  // POST-1 Fix Withdraw.
+  "CONFIRMATION_WITHDRAWN",
   // Phase 5 (contract §4.12): the Linux custodian's Codex sandbox basis is not approvable or changed since its confirmation.
   "CODEX_ISOLATION_UNAVAILABLE",
   // Phase 5 F-i2-5: the custodian's redaction of an amendment could not be established.

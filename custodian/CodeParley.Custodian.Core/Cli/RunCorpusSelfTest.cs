@@ -269,9 +269,28 @@ internal static class RunCorpusSelfTest
                 // Phase 4 Increment 3: what the custodian's measurement of the source gives during this transition (an
                 // application's begin, finish or reconciliation; default: the corpus's source, stable).
                 if (step["source"] is JsonObject src) CaptureFixture.Measurements.Spec = MeasurementOf(ctx, src);
+                // POST-1 Fix Withdraw (W3): `atPreGate` commits the named intent after this transition's preparatory reads and
+                // before its gate — the interleaving in which the other commit is decided first.
+                JsonObject? interleaved = null;
+                if (step["atPreGate"] is JsonValue pg)
+                {
+                    string intent = ctx.Intents[(string)pg!];
+                    string point = HoldPoints.RunPreGate + (string)step["kind"]!;
+                    GrantLedger.HoldHook = p =>
+                    {
+                        if (p != point || interleaved is not null) return;
+                        (JsonObject? r, string? c) = Execute(() => ctx.Ledger.Commit(intent, null));
+                        interleaved = new JsonObject { ["ok"] = c is null, ["code"] = c, ["operationStatus"] = r?["operationStatus"]?.DeepClone() };
+                    };
+                }
                 JsonObject result;
                 try { result = ctx.Ledger.RunTransition(caller, ctx.Repo, req); }
-                finally { if (step["source"] is JsonObject) CaptureFixture.Measurements.Spec = new SyntheticMeasurement(); }
+                finally
+                {
+                    if (step["source"] is JsonObject) CaptureFixture.Measurements.Spec = new SyntheticMeasurement();
+                    if (step["atPreGate"] is not null) GrantLedger.HoldHook = null;
+                }
+                if (interleaved is not null) result["interleaved"] = interleaved;
                 // P3.4C-5 Increment 3 (§4): the custodian's measurement of a checks operation's start and of each execution's
                 // end runs at once (the corpus's synthetic measurement), unless the step leaves it pending (measure: false).
                 bool measuring = ((string)step["kind"]! == "op_begin" && (string?)req.Fields["operationKind"] == "checks" && (string?)result["operationStatus"] == RunOperationStatuses.Measuring)
@@ -438,7 +457,41 @@ internal static class RunCorpusSelfTest
                 return new JsonObject { ["authorizationRequestId"] = rid };
             }
             case "commit":
-                return ctx.Ledger.Commit(ctx.Intents[(string)step["intent"]!], null);
+            {
+                // POST-1 Fix Withdraw (W18): `faultDelete` makes the content cleanup after the commit fail (the file stays).
+                bool fault = step["faultDelete"] is JsonValue fd && fd.GetValue<bool>();
+                if (fault) GrantLedger.DeleteFaultForTest = _ => true;
+                try { return ctx.Ledger.Commit(ctx.Intents[(string)step["intent"]!], null); }
+                finally { if (fault) GrantLedger.DeleteFaultForTest = null; }
+            }
+            // ---- POST-1 Fix Withdraw ----
+            case "fixWithdraw":
+            {
+                string rid = ctx.Next("fixwithdrawal");
+                // `repo`: the directory the request names ("none": no path, the guided selection's identity locates it);
+                // `expected`: the four selection fields exactly as sent (the dispatcher's own validation runs first).
+                string? path = step["repo"] is JsonValue rv ? ((string)rv! == "none" ? null : NamedPath(ctx, (string)rv!)) : ctx.Repo;
+                GrantLedger.WithdrawalSelection? expected = step["expected"] is JsonObject raw ? CustodianCore.WithdrawalSelectionOf(Resolve(ctx, raw.DeepClone())!.AsObject()) : null;
+                PreparedAuthorization p = ctx.Ledger.PrepareFixWithdrawal(path, run, ctx.Ops[(string)step["of"]!], rid, expected);
+                return new JsonObject { ["authorizationRequestId"] = p.RequestId, ["action"] = p.Action, ["rendering"] = p.Rendering, ["fixWithdrawal"] = p.Facts?.DeepClone() };
+            }
+            case "padEvents":
+            {
+                // W16: the run's log filled to `count` events (`bytes`: each padding event carries that many bytes), as a long run
+                // would leave it — written as the record is (test only).
+                string key = RepoIdentities.Resolve(NamedPath(ctx, "main")).Key;
+                RunRecord r = GrantLedger.ReadRunLocked(key, run) ?? throw new InvalidOperationException($"no run {run}");
+                int count = (int)RunFields.Integer(step["count"])!;
+                string filler = new('x', (int)(RunFields.Integer(step["bytes"]) ?? 0));
+                var events = r.Events.ToList();
+                while (events.Count < count)
+                {
+                    var payload = new JsonObject { ["padding"] = filler };
+                    events.Add(new RunEvent(events.Count + 1, "respond", ctx.Next("pad"), "implementer", null, new string('0', 64), r.Status, r.Status, DateTime.UtcNow.ToString("o"), payload));
+                }
+                GrantLedger.WriteRunForTest(r with { Events = events });
+                return new JsonObject { ["events"] = events.Count };
+            }
             case "capture":
             {
                 // P3.4C-5: capture the reserved review `of` with the corpus's synthetic capture (late: on the ledger instance

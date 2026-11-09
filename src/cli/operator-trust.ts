@@ -25,8 +25,9 @@ export const OPERATOR_WRAPPER = "/usr/local/sbin/code-parley-operator";
 export function isOperatorCommand(group: string | undefined, cmd: string | undefined, repoNamed = false): boolean {
   // Phase 5 F-3: `config propose` / `config propose-selftest` are the implementer's (it writes the payload it proposes).
   if (group === "config" && (cmd === "propose" || cmd === "propose-selftest")) return false;
-  // Phase 6 Increment 3: `setup` runs the operator's config and loop commands.
-  return group === "decide" || group === "amend" || group === "loop" || group === "config" || group === "setup" || (group === "fix" && (cmd === "confirm" || cmd === "reject")) || (group === "runs" && cmd === "stop" && repoNamed);
+  // Phase 6 Increment 3: `setup` runs the operator's config and loop commands. POST-1 Fix Withdraw (F-W1): `fix review` decides
+  // fixes and `fix withdraw` withdraws one: both are the operator's, so the operator's code must be the installed runtime.
+  return group === "decide" || group === "amend" || group === "loop" || group === "config" || group === "setup" || (group === "fix" && (cmd === "confirm" || cmd === "reject" || cmd === "review" || cmd === "withdraw")) || (group === "runs" && cmd === "stop" && repoNamed);
 }
 
 /** A variable the wrapper drops from the operator's environment. */

@@ -125,7 +125,7 @@ export class CustodianGrants {
     return {
       operationId: String(d["operationId"] ?? operationId), status: String(d["status"] ?? ""), proposalDigest: String(d["proposalDigest"] ?? ""),
       expiresAt: typeof d["expiresAt"] === "string" ? d["expiresAt"] : null, rendering: String(d["rendering"] ?? ""), renderingDigest: String(d["renderingDigest"] ?? ""),
-      confirmation: c ? { confirmationId: String(c["confirmationId"] ?? ""), decision: String(c["decision"] ?? ""), expiresAt: typeof c["expiresAt"] === "string" ? c["expiresAt"] : null, consumedAt: typeof c["consumedAt"] === "string" ? c["consumedAt"] : null } : null,
+      confirmation: c ? { confirmationId: String(c["confirmationId"] ?? ""), decision: String(c["decision"] ?? ""), expiresAt: typeof c["expiresAt"] === "string" ? c["expiresAt"] : null, consumedAt: typeof c["consumedAt"] === "string" ? c["consumedAt"] : null, withdrawnAt: typeof c["withdrawnAt"] === "string" ? c["withdrawnAt"] : null } : null,
     };
   }
 }
@@ -139,7 +139,7 @@ export interface FixRendering {
   /** The custodian's exact text (its last line names its own SHA-256). */
   rendering: string;
   renderingDigest: string;
-  confirmation: { confirmationId: string; decision: string; expiresAt: string | null; consumedAt: string | null } | null;
+  confirmation: { confirmationId: string; decision: string; expiresAt: string | null; consumedAt: string | null; withdrawnAt: string | null } | null;
 }
 
 /** P3.4C-5 Increment 3 (§5.1): the custodian's protected derivation of a run, asked for with the run's run.json bytes

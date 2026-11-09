@@ -63,6 +63,9 @@ internal sealed partial class GrantLedger
         ApplyPre? applyPre = req.Kind is RunKinds.OpBegin or RunKinds.OpFinish or RunKinds.ApplyReconcile ? ReadForApply(id, req) : null;
         // Phase 5 (§4.12): before the gate, the host's Codex sandbox basis is measured again for a review or fix begin.
         IsolationBasisRead? basisNow = ReadIsolationBasis(id.Key, req);
+        // POST-1 Fix Withdraw (W3): the preparatory reads are done and the gate is not held — what happens here (another
+        // transition's commit) is decided before this one, which the gated decision then sees.
+        Hold(HoldPoints.RunPreGate + req.Kind);
         JsonObject result;
         lock (EnterGate())
         {

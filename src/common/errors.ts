@@ -121,6 +121,8 @@ export type ErrorCode =
   | "FIX_DECLINED"
   | "CONFIRMATION_EXPIRED"
   | "CONFIRMATION_CONSUMED"
+  // POST-1 Fix Withdraw: the owner withdrew the confirmation; it can never be applied.
+  | "CONFIRMATION_WITHDRAWN"
   | "APPLY_IN_PROGRESS"
   | "FIX_STALE"
   /** A confirmed proposal that cannot be applied faithfully on this platform (nothing was begun). */

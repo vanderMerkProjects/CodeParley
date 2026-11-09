@@ -184,7 +184,8 @@ boot, and calls in that window fail `CUSTODIAN_UNAVAILABLE`. Wait and retry.
 | `FIX_DELEGATION_UNAVAILABLE` | A delegated fix needs a protected run through the validated custodian, a protected configuration in force, a fix budget and the operator's FIX self-test confirmation | `status --repo <path>` shows which is missing. Budget: `code-parley init --repo <path> --max-fixes <n>`; a new run picks it up. Confirmation: the operator runs `setup --fix --repo <path>` |
 | `EVIDENCE_NOT_HELD` | No finished review with a published capture to seed a fix from, or the confirmed content cannot be vouched for | Run a review first. For a proposal: delegate again |
 | `FIX_NOT_CONFIRMED`, `FIX_DECLINED` | No confirmation is held, or the operator rejected the proposal | Nothing is applied. Confirm it, or delegate again |
-| `CONFIRMATION_EXPIRED` | The confirmation expired before it was applied | The operator runs `fix confirm <run> <proposal> --repo <path>` |
+| `CONFIRMATION_EXPIRED` | The confirmation expired before it was applied | A confirmed fix is not confirmed again: ask Claude to delegate the fix again. The operator can withdraw the expired one (`fix withdraw <run-id> <proposal> --repo <path>`) |
+| `CONFIRMATION_WITHDRAWN` | The operator withdrew the confirmation; the fix can never be applied | A new delegation, if the fix is still wanted |
 | `CONFIRMATION_CONSUMED` | The confirmation was already used | A new delegation and confirmation |
 | `CONFIRMATION_CONTENT_MISMATCH` | The rendering cannot be re-derived from what the custodian holds, or differs from the one confirmed | Nothing is recorded. Delegate again |
 | `FIX_STALE` | The working tree moved since the fix's baseline | Nothing was written and the confirmation stays unused. Delegate again from a new review |

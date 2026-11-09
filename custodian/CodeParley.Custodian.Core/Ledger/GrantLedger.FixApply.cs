@@ -242,6 +242,7 @@ internal sealed partial class GrantLedger
             {
                 ["confirmationId"] = confirmation["confirmationId"]?.DeepClone(), ["decision"] = confirmation["decision"]?.DeepClone(),
                 ["expiresAt"] = confirmation["expiresAt"]?.DeepClone(), ["consumedAt"] = confirmation["consumedAt"]?.DeepClone(),
+                ["withdrawnAt"] = confirmation["withdrawnAt"]?.DeepClone(),
             },
         };
     }
@@ -265,6 +266,7 @@ internal sealed partial class GrantLedger
             RunRecord run = ReadRun(id.Key, runId) ?? throw new CustodianRefusal(ErrorCodes.RunNotOpen, "the custodian holds no record of this run");
             RunOperation op = FixOperationOf(run, operationId);
             RequirePending(run, op, _clock());
+            RequireLogRoom(run, null, "a decision"); // F-W3: the decision's own write checks the size cap
             if (read.Problem is not null || read.Rendering is null)
                 throw new CustodianRefusal(ErrorCodes.EvidenceNotHeld, $"the custodian cannot render delegated fix {operationId}, so nothing can be confirmed: {read.Problem}");
             JsonObject p = ProposalOf(op)!;
@@ -403,6 +405,11 @@ internal sealed partial class GrantLedger
                 ["paths"] = new JsonArray([.. changed.Take(MaxListedPaths).Select(c => (JsonNode)FixRendering.Escape(c))]), ["pathCount"] = changed.Count,
                 ["proposedAt"] = (string?)p["createdAt"], ["expiresAt"] = expiresAt,
                 ["confirmationExpiresAt"] = state == "waiting" ? (string?)confirmation?["expiresAt"] : null,
+                // POST-1 Fix Withdraw: a confirmed fix of an open run (waiting, or its confirmation expired or voided) can be
+                // withdrawn; the guided withdrawal names these values back (its selection, never authority).
+                ["withdrawable"] = op.Status == FixConfirmed && !run.IsTerminal && (string?)confirmation?["decision"] == "confirm",
+                ["confirmationId"] = op.Status == FixConfirmed ? (string?)confirmation?["confirmationId"] : null,
+                ["confirmedRenderingDigest"] = op.Status == FixConfirmed ? (string?)confirmation?["renderingDigest"] : null,
             };
             rows.Add((Array.IndexOf(ListedStates, state), expiresAt, entry, run, op, id));
         }
@@ -489,6 +496,7 @@ internal sealed partial class GrantLedger
         if (rerendered is null || FixDecisionStateDigest(run, (string)args["operationId"]!, rerendered) != recordedState)
             throw new CustodianRefusal(ErrorCodes.ConfirmationContentMismatch, "the proposal, its boundary, its baseline or the custodian's rendering changed since it was prepared; nothing was committed — show and decide again");
         RequirePending(run!, FixOperationOf(run!, (string)args["operationId"]!), now);
+        RequireLogRoom(run!, null, "a decision"); // F-W3
     }
 
     /// <summary>Record the owner's decision on the fix operation (single hold, after the freshness checks).</summary>
@@ -521,7 +529,6 @@ internal sealed partial class GrantLedger
         {
             p["retiredAt"] = Iso(now);
             p["retiredReason"] = FixDeclined;
-            _retiredProposals.Enqueue(ProposalPath(repoKey, runId, operationId));
         }
         RunRecord next = run with { Operations = ReplaceOperation(run, op with { Status = status, Outcome = outcome }) };
         var result = new JsonObject
@@ -534,7 +541,10 @@ internal sealed partial class GrantLedger
         var stored = new JsonObject { ["runId"] = runId, ["kind"] = FixDecisionAction, ["runRevision"] = revision, ["status"] = next.Status };
         foreach (KeyValuePair<string, JsonNode?> kv in result) stored[kv.Key] = kv.Value?.DeepClone();
         var evidence = new RunEvent(run.Events.Count + 1, FixDecisionAction, requestId, "operator", null, Digest.Sha256Hex(Digest.Canonical(stored)), run.Status, next.Status, Iso(now), (JsonObject)stored.DeepClone());
-        WriteRun(next with { RunRevision = revision, Events = [.. run.Events, evidence] });
+        RunRecord written = next with { RunRevision = revision, Events = [.. run.Events, evidence] };
+        RequireLogRoom(run, written, "a decision"); // F-W3: the event count and the size cap, as every run transition
+        WriteRun(written);
+        if (decision == "reject") _retiredProposals.Enqueue(ProposalPath(repoKey, runId, operationId)); // only once recorded
         Audit($"fix_decision committed decision={decision} runId={runId} operationId={operationId} confirmationId={confirmationId} rendering={((string?)args["renderingDigest"])?[..16]} requestId={requestId} assurance={Platform.OperatorAssurance}");
         return stored;
     }
@@ -612,13 +622,16 @@ internal sealed partial class GrantLedger
             case FixConfirmed: break;
             case FixConsumed: throw new CustodianRefusal(ErrorCodes.ConfirmationConsumed, $"the confirmation of delegated fix {fixOperationId} was already used by application {(string?)confirmation?["consumedBy"]}; a confirmation is single use");
             case FixDeclined: throw new CustodianRefusal(ErrorCodes.FixDeclined, $"the owner rejected delegated fix {fixOperationId}; nothing is applied");
+            // POST-1 Fix Withdraw: the status is checked first, so a withdrawn confirmation is refused before its configuration,
+            // content or measurement count for anything.
+            case FixWithdrawn: throw new CustodianRefusal(ErrorCodes.ConfirmationWithdrawn, $"the owner withdrew the confirmation of delegated fix {fixOperationId} at {(string?)confirmation?["withdrawnAt"]}; it can never be applied; nothing was applied");
             default: throw new CustodianRefusal(ErrorCodes.FixNotConfirmed, $"delegated fix {fixOperationId} has no owner confirmation ({fix.Status}); the owner confirms the custodian's rendering with `{OperatorWording.Cli} fix confirm <run> <proposal> --repo <path>`");
         }
         JsonObject p = ProposalOf(fix)!;
         if (confirmation is null || (string?)confirmation["decision"] != "confirm" || (string?)confirmation["repoKey"] != run.RepoKey || (string?)confirmation["runId"] != run.RunId)
             throw new CustodianRefusal(ErrorCodes.FixNotConfirmed, $"delegated fix {fixOperationId} has no confirmation for this repository and run");
         if (ParseTime((string)confirmation["expiresAt"]!) <= now || p["retiredAt"] is not null)
-            throw new CustodianRefusal(ErrorCodes.ConfirmationExpired, $"the confirmation of delegated fix {fixOperationId} has expired; the owner confirms it again (`{OperatorWording.Cli} fix confirm <run> <proposal> --repo <path>`) while the proposal lives");
+            throw new CustodianRefusal(ErrorCodes.ConfirmationExpired, $"the confirmation of delegated fix {fixOperationId} has expired; it can no longer be applied, and a confirmed fix is not confirmed again: delegate the fix again, or the owner withdraws it (`{OperatorWording.Cli} fix withdraw <run> <proposal> --repo <path>`)");
         string digest = (string)p["proposalDigest"]!;
         if ((string)f["proposalDigest"]! != digest || (string?)confirmation["proposalDigest"] != digest)
             throw new CustodianRefusal(ErrorCodes.EvidenceNotHeld, $"proposal {(string)f["proposalDigest"]!} is not the confirmed proposal of delegated fix {fixOperationId}");

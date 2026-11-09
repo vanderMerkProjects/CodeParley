@@ -12,7 +12,7 @@
 import { DomainError } from "../common/errors.js";
 import { uuidv7 } from "../common/ids.js";
 import { CustodianGrants, type FixRendering } from "../custodian/grants.js";
-import { CustodianOperator, type FixListing, type FixListingEntry, type PreparedFixDecision } from "../custodian/operator.js";
+import { CustodianOperator, type FixListing, type FixListingEntry, type PreparedFixDecision, type PreparedFixWithdrawal } from "../custodian/operator.js";
 import type { CustodianTransport } from "../custodian/transport.js";
 
 /** Step 7.1: the listing's and the prepared decision's types, for `fix review` (which reaches the operator client only through
@@ -40,6 +40,29 @@ export async function listFixProposals(transport: CustodianTransport, repository
 export async function renderListedFix(transport: CustodianTransport, entry: FixListingEntry): Promise<FixRendering> {
   if (entry.repositoryRoot === null) throw new DomainError("INVALID_ARGUMENT", "this fix has no repository path that resolves to its identity");
   return new CustodianGrants(transport).renderFixProposal("operator", entry.repositoryRoot, entry.runId, entry.operationId);
+}
+
+// ---- POST-1 Fix Withdraw (operator surface only): the withdrawal of one confirmed, unconsumed fix ----
+
+export type { FixWithdrawalFacts, PreparedFixWithdrawal } from "../custodian/operator.js";
+
+/** Phase 1 of a direct withdrawal: the custodian selects the fix's current confirmation and binds it. */
+export async function prepareFixWithdrawal(transport: CustodianTransport, repositoryRoot: string, runId: string, operationId: string): Promise<PreparedFixWithdrawal> {
+  return new CustodianOperator(transport).prepareFixWithdrawal(repositoryRoot, runId, operationId, uuidv7());
+}
+
+/** Phase 1 of a guided withdrawal: the listed entry's identity, confirmation and digests (all four), located by its path
+ * when one resolves, else by its listed identity. */
+export async function prepareGuidedFixWithdrawal(transport: CustodianTransport, entry: FixListingEntry): Promise<PreparedFixWithdrawal> {
+  if (!entry.withdrawable || entry.confirmationId === null || entry.confirmedRenderingDigest === null) throw new DomainError("INVALID_ARGUMENT", "this fix is not one the custodian lists as withdrawable");
+  return new CustodianOperator(transport).prepareFixWithdrawal(entry.repositoryRoot, entry.runId, entry.operationId, uuidv7(), {
+    repoKey: entry.repoKey, confirmationId: entry.confirmationId, proposalDigest: entry.proposalDigest, renderingDigest: entry.confirmedRenderingDigest,
+  });
+}
+
+/** Phase 2 of a withdrawal (operator surface). */
+export async function commitFixWithdrawal(transport: CustodianTransport, authorizationRequestId: string): Promise<{ operationStatus: string; confirmationId: string; renderingDigest: string; withdrawnAt: string; assurance: string }> {
+  return new CustodianOperator(transport).commitFixWithdrawal(authorizationRequestId);
 }
 
 /** Phase 1 of a guided decision: prepared only for the listed proposal and the rendering reviewed (all three expected

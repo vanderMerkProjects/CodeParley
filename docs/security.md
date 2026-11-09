@@ -176,7 +176,30 @@ These are the known limits of this release. They are stated as they are.
 
 ### Stopping a confirmed fix
 
-A confirmation has no withdrawal of its own in this release. It can only be stopped from outside:
+**Withdraw it.** The operator withdraws one confirmed fix that has not been applied:
+
+```text
+code-parley fix withdraw <full-run-id> <proposal> --repo <path>
+```
+
+`fix review` offers the same for a confirmed fix that is waiting for its application. On Linux it is
+`/usr/local/sbin/code-parley-operator`, as the operator account; on Windows an elevated terminal as the operator account.
+The implementer cannot withdraw.
+
+- **It is permanent.** The custodian records the withdrawal in the run's record in one write and refuses every later
+  application of the fix (`CONFIRMATION_WITHDRAWN`). That check comes before any configuration check, so a restart,
+  setting the configuration again, renewed authority or a resumed session never makes it applicable again. A fix is never
+  confirmed again; Claude can delegate it again as a new fix, which the operator decides on anew.
+- **It reduces authority only.** It needs no repository configuration in force and works while one is revoked. It changes
+  nothing else: not the run, not another fix, not the configuration, and no file. A fix applied earlier stays as it is.
+- **It never claims what did not happen.** The custodian selects the fix's current confirmation and binds the withdrawal to
+  it. If the fix was applied, withdrawn or its run ended after you prepared the withdrawal, the commit is refused and
+  records nothing. An application that already began cannot be withdrawn (`CONFIRMATION_CONSUMED`): the confirmation is
+  single use and was used. Withdrawing a fix that is already withdrawn says so and exits 0.
+- **A full run log.** If the run's log is full, the custodian cannot record a withdrawal (`BUDGET_EXHAUSTED`). End the run
+  instead (below): that also makes the fix inapplicable.
+
+**Other ways a confirmed fix is stopped:**
 
 - `fix reject` works only on a proposal that is still pending. It is refused on a confirmed fix.
 - `loop revoke`, `loop stop` and revoking the FIX self-test confirmation do not stop a confirmed fix.
@@ -203,8 +226,8 @@ A confirmation has no withdrawal of its own in this release. It can only be stop
 - **`--close` is refused while an operation runs** (`RUN_BUSY`): use `--abort`. With `--repo`, nothing local is cancelled:
   a running operation finishes on its own, and the implementer's record catches up on its next call.
 - **If the custodian cannot answer, the run has not ended.** Use `config revoke` to block applications in the meantime,
-  remembering that it is a suspension: it does not withdraw a confirmation, and setting the configuration again lifts it.
-  Repeat the stop once the custodian answers.
+  remembering that it is a suspension: it does not withdraw a confirmation, and setting the configuration again lifts it
+  (`fix withdraw` does withdraw one). Repeat the stop once the custodian answers.
 
 ### Availability
 

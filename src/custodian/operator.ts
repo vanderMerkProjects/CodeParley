@@ -150,6 +150,27 @@ export class CustodianOperator {
     return { decision: String(d["decision"] ?? ""), operationStatus: String(d["operationStatus"] ?? ""), confirmationId: String(d["confirmationId"] ?? ""), renderingDigest: String(d["renderingDigest"] ?? ""), expiresAt: typeof d["expiresAt"] === "string" ? d["expiresAt"] : null };
   }
 
+  /** POST-1 Fix Withdraw: prepare the withdrawal of a fix's current confirmation (the custodian selects it and binds it). The
+   * repository is located by its path, or, for a guided selection only, by the listed identity (`repositoryRoot` null). */
+  async prepareFixWithdrawal(repositoryRoot: string | null, runId: string, operationId: string, requestId: string, expected?: { repoKey: string; confirmationId: string; proposalDigest: string; renderingDigest: string }): Promise<PreparedFixWithdrawal> {
+    const args: Record<string, unknown> = { runId, operationId };
+    if (repositoryRoot !== null) args["repositoryRoot"] = repositoryRoot;
+    if (expected) Object.assign(args, { expectedRepoKey: expected.repoKey, expectedConfirmationId: expected.confirmationId, expectedProposalDigest: expected.proposalDigest, expectedRenderingDigest: expected.renderingDigest });
+    const res = await this.op("prepare_fix_withdrawal", args, requestId);
+    if (!res.ok) throw custodianError(res.code, res.error ?? "prepare_fix_withdrawal failed");
+    const d = res.data ?? {};
+    return { authorizationRequestId: String(d["authorizationRequestId"] ?? requestId), rendering: String(d["rendering"] ?? ""), expiresAt: String(d["expiresAt"] ?? ""), facts: fixWithdrawalFactsOf(d["fixWithdrawal"]) };
+  }
+
+  /** POST-1 Fix Withdraw: commit a prepared withdrawal; a fix withdrawn, consumed or ended since the prepare refuses. */
+  async commitFixWithdrawal(authorizationRequestId: string): Promise<{ operationStatus: string; confirmationId: string; renderingDigest: string; withdrawnAt: string; assurance: string }> {
+    const com = await this.op("commit", { authorizationRequestId }, uuidv7());
+    if (!com.ok) throw custodianError(com.code, com.error ?? "commit (fix withdrawal) failed");
+    const d = com.data ?? {};
+    if (d["kind"] !== "fix_withdrawal" || d["operationStatus"] !== "withdrawn") throw malformed("withdrawal answer");
+    return { operationStatus: String(d["operationStatus"]), confirmationId: String(d["confirmationId"] ?? ""), renderingDigest: String(d["renderingDigest"] ?? ""), withdrawnAt: String(d["withdrawnAt"] ?? ""), assurance: String(d["assurance"] ?? "") };
+  }
+
   /** Phase 2: commit the prepared change the operator confirmed (the custodian re-checks every affected record's state
    * in the same hold as its write; any change refuses it STALE_CONFIG, and nothing is committed). */
   async commitConfigRecord(authorizationRequestId: string): Promise<ConfigCommit> {
@@ -182,6 +203,8 @@ export const FIX_LISTING_SCHEMA = "codeparley.custodian-fix-listing.v1";
 /** The custodian's bound on a listing's entries (GrantLedger.MaxListedFixes); a longer answer is refused. */
 export const MAX_LISTED_FIX_ENTRIES = 50;
 export const FIX_DECISION_FACTS_SCHEMA = "codeparley.custodian-fix-decision-prepared.v1";
+/** POST-1 Fix Withdraw (GrantLedger.FixWithdrawalFactsSchema). */
+export const FIX_WITHDRAWAL_FACTS_SCHEMA = "codeparley.custodian-fix-withdrawal-prepared.v1";
 
 export type FixListingState = "pending" | "unavailable" | "waiting" | "expired" | "ineligible";
 
@@ -206,6 +229,11 @@ export interface FixListingEntry {
   proposedAt: string | null;
   expiresAt: string;
   confirmationExpiresAt: string | null;
+  /** POST-1 Fix Withdraw: a confirmed fix of an open run the operator can withdraw, its confirmation and the rendering it
+   * confirmed (false / null from a custodian that predates withdrawal). */
+  withdrawable: boolean;
+  confirmationId: string | null;
+  confirmedRenderingDigest: string | null;
 }
 
 export interface FixListing {
@@ -264,6 +292,7 @@ export function fixListingOf(d: Record<string, unknown>): FixListing {
       renderingDigest: optStr(e["renderingDigest"], "rendering digest"), changeCount: num(e["changeCount"], "change count"), totalBytes: num(e["totalBytes"], "size"),
       paths: (e["paths"] as unknown[]).map((p) => str(p, "path")), pathCount: num(e["pathCount"], "path count"), proposedAt: optStr(e["proposedAt"], "time"),
       expiresAt: str(e["expiresAt"], "expiry"), confirmationExpiresAt: optStr(e["confirmationExpiresAt"], "expiry"),
+      withdrawable: e["withdrawable"] === true, confirmationId: optStr(e["confirmationId"], "confirmation id"), confirmedRenderingDigest: optStr(e["confirmedRenderingDigest"], "rendering digest"),
     };
   });
   // The bound and its accounting: never more than the custodian's bound, a cut reported as such, its pending ones counted.
@@ -274,6 +303,40 @@ export function fixListingOf(d: Record<string, unknown>): FixListing {
     throw malformed("listing bound");
   }
   return { snapshotAt: str(d["snapshotAt"], "listing time"), total, truncated: d["truncated"], omittedPending, listingDigest: str(d["listingDigest"], "listing digest"), entries };
+}
+
+/** POST-1 Fix Withdraw: a prepared withdrawal as the custodian reports it (GrantLedger.FixWithdrawalFactsSchema). */
+export interface FixWithdrawalFacts {
+  repoKey: string;
+  repositoryRoot: string | null;
+  runId: string;
+  operationId: string;
+  confirmationId: string;
+  proposalDigest: string | null;
+  renderingDigest: string | null;
+  confirmationExpiresAt: string | null;
+  alreadyNotApplicable: boolean;
+}
+
+export interface PreparedFixWithdrawal {
+  authorizationRequestId: string;
+  rendering: string;
+  expiresAt: string;
+  facts: FixWithdrawalFacts;
+}
+
+/** A prepared withdrawal's facts, checked (a custodian that sends none, or another schema, is refused: nothing is decided). */
+export function fixWithdrawalFactsOf(v: unknown): FixWithdrawalFacts {
+  if (!v || typeof v !== "object") throw malformed("prepared withdrawal");
+  const f = v as Record<string, unknown>;
+  if (f["schema"] !== FIX_WITHDRAWAL_FACTS_SCHEMA) throw malformed(`prepared withdrawal (schema ${JSON.stringify(f["schema"] ?? null)})`);
+  if (typeof f["alreadyNotApplicable"] !== "boolean") throw malformed("prepared withdrawal");
+  return {
+    repoKey: str(f["repoKey"], "prepared withdrawal"), repositoryRoot: optStr(f["repositoryRoot"], "prepared withdrawal"), runId: str(f["runId"], "prepared withdrawal"),
+    operationId: str(f["operationId"], "prepared withdrawal"), confirmationId: str(f["confirmationId"], "prepared withdrawal"),
+    proposalDigest: optStr(f["proposalDigest"], "prepared withdrawal"), renderingDigest: optStr(f["renderingDigest"], "prepared withdrawal"),
+    confirmationExpiresAt: optStr(f["confirmationExpiresAt"], "prepared withdrawal"), alreadyNotApplicable: f["alreadyNotApplicable"],
+  };
 }
 
 /** A prepared decision's facts, checked; null when the custodian sent none (one that predates Step 7.1). */

@@ -25,7 +25,7 @@ const CORPUS_PATH = join(ROOT, "test", "fixtures", "run-transition-corpus.json")
 
 type Json = Record<string, unknown>;
 interface Step extends Json {
-  op: "t" | "mint" | "bind" | "loop" | "replay" | "list" | "amend" | "decide" | "commit" | "dropRun" | "grant" | "config" | "revokeGlobal" | "recover" | "capture" | "tamper" | "restart" | "measure" | "derive" | "exports" | "orphan" | "sweep" | "advance" | "fixConfirm" | "held" | "orphanProposal" | "fixPrepare" | "fixRender" | "fixList" | "repo" | "moveRepo" | "unpin" | "grantIdentity";
+  op: "t" | "mint" | "bind" | "loop" | "replay" | "list" | "amend" | "decide" | "commit" | "dropRun" | "grant" | "config" | "revokeGlobal" | "recover" | "capture" | "tamper" | "restart" | "measure" | "derive" | "exports" | "orphan" | "sweep" | "advance" | "fixConfirm" | "held" | "orphanProposal" | "fixPrepare" | "fixRender" | "fixList" | "repo" | "moveRepo" | "unpin" | "grantIdentity" | "fixWithdraw" | "padEvents";
 }
 interface Scenario {
   name: string;
@@ -248,12 +248,26 @@ class Runner {
         if (!this.sent.has(requestId)) this.sent.set(requestId, { surface, args, requestId, mode: { ...this.mode } });
         // Phase 4 Increment 3: what the custodian's measurement of the source gives during this transition (RunCorpusSelfTest).
         if (s["source"] && typeof s["source"] === "object") this.t.setSyntheticMeasurement(this.measuredSpec(s["source"] as Json));
+        // POST-1 Fix Withdraw (W3; RunCorpusSelfTest atPreGate): the named intent is committed after this transition's
+        // preparatory reads and before its hold.
+        let interleaved: Json | null = null;
+        if (typeof s["atPreGate"] === "string") {
+          const intent = this.intents.get(s["atPreGate"] as string)!;
+          this.t.preGateHookForTest = async (op) => {
+            if (op !== "run_transition" || interleaved !== null) return;
+            interleaved = {};
+            const r = await this.t.send("operator", "commit", { authorizationRequestId: intent }, `commit-${++this.generated}`);
+            interleaved = { ok: r.ok, code: r.ok ? null : r.code ?? null, operationStatus: r.ok ? (r.data?.["operationStatus"] ?? null) : null };
+          };
+        }
         let res: CustodianResponse;
         try {
           res = await this.t.send(surface, "run_transition", args, requestId);
         } finally {
           if (s["source"] && typeof s["source"] === "object") this.t.setSyntheticMeasurement({});
+          if (typeof s["atPreGate"] === "string") this.t.preGateHookForTest = null;
         }
+        if (interleaved !== null && res.ok) res = { ...res, data: { ...(res.data ?? {}), interleaved } };
         // P3.4C-5 Increment 3 (§4): the custodian's measurement of a checks operation's start and of each execution's end
         // runs at once (the corpus's synthetic measurement), unless the step leaves it pending (RunCorpusSelfTest).
         const fields = args["fields"] as Json;
@@ -420,8 +434,23 @@ class Runner {
       }
       case "commit": {
         const id = this.intents.get(String(s["intent"]))!;
-        return this.t.send("operator", "commit", { authorizationRequestId: id }, `commit-${++this.generated}`);
+        // POST-1 Fix Withdraw (W18): `faultDelete` makes the content cleanup after the commit fail.
+        if (s["faultDelete"] === true) this.t.deleteFaultForTest = true;
+        try {
+          return await this.t.send("operator", "commit", { authorizationRequestId: id }, `commit-${++this.generated}`);
+        } finally {
+          this.t.deleteFaultForTest = false;
+        }
       }
+      // ---- POST-1 Fix Withdraw (RunCorpusSelfTest) ----
+      case "fixWithdraw": {
+        const repo = typeof s["repo"] === "string" ? (s["repo"] === "none" ? null : this.namedPath(s["repo"])) : this.repo;
+        const expected = s["expected"] ? (this.resolve(s["expected"]) as Json) : {};
+        const res = await this.t.send("operator", "prepare_fix_withdrawal", { ...(repo === null ? {} : { repositoryRoot: repo }), runId: run, operationId: this.ops.get(String(s["of"]))!, ...expected }, `fixwithdrawal-${++this.generated}`);
+        return res.ok ? { ok: true, data: { authorizationRequestId: res.data?.["authorizationRequestId"], action: res.data?.["action"], rendering: res.data?.["rendering"], fixWithdrawal: res.data?.["fixWithdrawal"] ?? null } } : res;
+      }
+      case "padEvents":
+        return { ok: true, data: { events: this.t.padRunEventsForTest(this.namedPath("main"), run, Number(s["count"]), Number(s["bytes"] ?? 0)) } };
       default:
         throw new Error(`unknown corpus op ${String(s.op)}`);
     }

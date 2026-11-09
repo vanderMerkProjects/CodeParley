@@ -24,6 +24,7 @@ import type { CustodianTransport } from "../custodian/transport.js";
 import { commitFixDecision, listFixProposals, prepareGuidedFixDecision, renderListedFix, type FixDecisionFacts, type FixListing, type FixListingEntry, type PreparedFixDecision } from "../engine/fix-decision.js";
 import { hostOperatorAssurance } from "../schemas/user-authority.js";
 import type { CliIo } from "./cli.js";
+import { withdrawListed } from "./fix-withdraw.js";
 
 /** The largest rendering `fix review` shows (it refuses a larger one rather than cut it; the custodian's own bounds keep a
  * proposal far below this). */
@@ -71,16 +72,21 @@ export async function runFixReview(transport: CustodianTransport, io: CliIo, opt
       io.out(`${custodianText(answer)} is not a listed number.`);
       continue;
     }
-    const outcome = await reviewOne(transport, io, prompt, entry, opts);
+    // POST-1 Fix Withdraw: a confirmed fix waiting for its application is offered for withdrawal only.
+    const outcome = isWithdrawable(entry) ? await withdrawListed(transport, io, prompt, entry) : await reviewOne(transport, io, prompt, entry, opts);
     if (outcome === "quit") return 0;
     io.out("");
   }
   return 0;
 }
 
-/** Print the listing; returns the selectable entries in their numbered order. */
+/** POST-1 Fix Withdraw: a listed fix the operator can withdraw (a confirmed fix of an open run, with its confirmation). */
+const isWithdrawable = (e: FixListingEntry): boolean => e.withdrawable && e.confirmationId !== null && e.confirmedRenderingDigest !== null;
+
+/** Print the listing; returns the selectable entries in their numbered order (pending fixes to review, confirmed fixes to
+ * withdraw). */
 function showListing(io: CliIo, listing: FixListing): FixListingEntry[] {
-  const selectable = listing.entries.filter((e) => e.selectable && e.state === "pending" && e.renderingDigest !== null && e.repositoryRoot !== null);
+  const selectable = listing.entries.filter((e) => (e.selectable && e.state === "pending" && e.renderingDigest !== null && e.repositoryRoot !== null) || isWithdrawable(e));
   io.out(`Delegated fixes held by the CodeParley custodian (as of ${custodianText(listing.snapshotAt)}):`);
   if (listing.entries.length === 0) {
     io.out("  none");
@@ -89,7 +95,7 @@ function showListing(io: CliIo, listing: FixListing): FixListingEntry[] {
   }
   let k = 0;
   for (const e of listing.entries) {
-    const label = e.selectable && selectable.includes(e) ? String(++k).padStart(3) : "  -";
+    const label = selectable.includes(e) ? String(++k).padStart(3) : "  -";
     const where = e.repositoryDisplay ?? (e.lastKnownPath ? `(last at ${e.lastKnownPath}; moved or unavailable — run fix review --repo <its path>)` : `(identity ${custodianText(e.repoKey)})`);
     const files = `${e.changeCount} file${e.changeCount === 1 ? "" : "s"}, ${e.totalBytes} bytes`;
     io.out(`${label}  ${where}  run ${custodianText(e.runId)}  fix ${custodianText(e.operationId)}  ${files}  ${stateText(e)}`);
@@ -114,11 +120,11 @@ function stateText(e: FixListingEntry): string {
     case "unavailable":
       return "not selectable: its repository is not at any path the custodian has recorded";
     case "waiting":
-      return `confirmed, waiting for the session to apply it${e.confirmationExpiresAt ? ` (until ${custodianText(e.confirmationExpiresAt)})` : ""}`;
+      return `confirmed, waiting for the session to apply it${e.confirmationExpiresAt ? ` (until ${custodianText(e.confirmationExpiresAt)})` : ""}${isWithdrawable(e) ? "; you can withdraw it" : ""}`;
     case "expired":
       return "expired: it can no longer be decided";
     case "ineligible":
-      return `cannot be decided (${custodianText(e.reasonCode ?? "ineligible")})`;
+      return `cannot be decided (${custodianText(e.reasonCode ?? "ineligible")})${isWithdrawable(e) ? "; you can withdraw it" : ""}`;
   }
 }
 
