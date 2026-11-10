@@ -22,7 +22,10 @@
 // committed public key (scripts/ci/verify-commit-identity.mjs). --allow-dirty stages from a tree with changes or an
 // unverified commit for a dry run: every BUILD-ID and the manifest then say releaseCandidate: false. --test-version <v>
 // stages under another version (the VM gates' upgrade and rollback need two): such a build is marked testBuild and is
-// never a release candidate.
+// never a release candidate. A build that would be a release candidate also needs its commit integrated into the
+// fetched main (refs/remotes/origin/main) by the GitHub merge of its pull request, the merge's second parent with the
+// same tree (C-1, lib/release-verify.mjs); otherwise staging refuses, --allow-dirty or not. A test build is staged
+// before that integration, for qualification.
 // Exit status: 0 staged; 1 a check failed; 2 a usage or tool error.
 
 import { cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, closeSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -32,6 +35,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { productionPackages } from "./lib/production-packages.mjs";
 import { buildId, buildManifest } from "./lib/release-manifest.mjs";
+import { COMMIT_KEY, MAIN_REF, RELEASE_KEY, defaultGpg, stagingSourceGate } from "./lib/release-verify.mjs";
 import { satisfies } from "./lib/semver-lite.mjs";
 import { npmCli, runOk, sha256File } from "./lib/tools.mjs";
 
@@ -111,6 +115,17 @@ function main() {
     process.stderr.write(`stage-release: refusing: ${dirty ? "the tree has changes" : ""}${dirty && signature !== "verified" ? " and " : ""}${signature !== "verified" ? "the commit's signature did not verify" : ""} (a release candidate is staged only from a clean, signed commit; --allow-dirty stages a dry run)\n`);
     return 1;
   }
+  // C-1 (D-107): a build that would be a release candidate is staged only from a source integrated into the fetched
+  // main by its GitHub merge (lib/release-verify.mjs releaseSourceProblems), --allow-dirty or not. A test build or a dry
+  // run needs no integration, and is never a release candidate.
+  const gate = stagingSourceGate({ repo: REPO, commit, version, gpg: o.gpg || defaultGpg(), pins: RELEASE_KEY, commitPin: COMMIT_KEY.primary, dirty, signature, testBuild });
+  if (gate.problems.length) {
+    process.stderr.write(`stage-release: refusing: ${commit} is not an integrated release source:\n${gate.problems.map((s) => `  - ${s}`).join("\n")}\n(a release candidate is staged only after its pull request is merged into main; --test-version stages a test build before that, which is never a release candidate)\n`);
+    return 1;
+  }
+  process.stdout.write(gate.required
+    ? `release source: ${commit}, integrated into ${MAIN_REF} (${gate.integration.main}) by the GitHub merge ${gate.integration.merge}, the same tree\n`
+    : `release source integration: not checked: ${gate.why}\n`);
   const nodeWin = nodeVersion(o.nodeWin, "windows");
   const nodeLinux = nodeVersion(o.nodeLinux, "linux");
   for (const [p, v] of [[o.nodeWin, nodeWin], [o.nodeLinux, nodeLinux]])

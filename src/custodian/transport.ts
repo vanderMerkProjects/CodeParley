@@ -26,7 +26,7 @@ import {
 } from "./simulated-loops.js";
 import {
   FIX_LISTING_SCHEMA, LISTED_FIX_STATES, MAX_LISTED_FIXES, compareListingRows, expectedSelectionOf, fixCandidatePaths, listableFixes, listingEntry,
-  applyFixDecision, applyRunTransition, commitCapture, proposalKey, commitCheckEnd, commitCheckStart, heldProposalRead, heldReadTarget, isRunTerminal, parseRunRequest, prepareFixDecision,
+  applyFixDecision, applyFixWithdrawal, applyRunTransition, prepareFixWithdrawal, requireFreshFixWithdrawal, withdrawalSelectionOf, FIX_WITHDRAWAL_ACTION, commitCapture, proposalKey, commitCheckEnd, commitCheckStart, heldProposalRead, heldReadTarget, isRunTerminal, parseRunRequest, prepareFixDecision,
   reconcileCapturesAtStart, requireFreshFixDecision, retentionSweep, runKey, runLimits, runSection, evidenceKey, evidenceRefsOf, redactionBasisDigest, unestablishedAmendment,
   type SimApplyMeasure, type SimApplyPre, type SimCaptureEnd, type SimCaptureTicket, type SimExportRehash, type SimHeldProposal, type SimHeldRead, type SimRun, type SimRunStore, type SimWriter,
 } from "./simulated-runs.js";
@@ -116,7 +116,7 @@ export type SimulatedCaller = "operator" | "implementer";
 const AUTH_TTL_MS = 120_000;
 
 /** Operations only the operator class may perform (they create or reduce authority, or probe the service). */
-const OPERATOR_ONLY_OPS: ReadonlySet<CustodianOp> = new Set<CustodianOp>(["prepare_grant", "prepare_revoke", "commit", "prepare_user_record", "prepare_config_record", "service_identity", "prepare_fix_decision", "list_fix_proposals"]);
+const OPERATOR_ONLY_OPS: ReadonlySet<CustodianOp> = new Set<CustodianOp>(["prepare_grant", "prepare_revoke", "commit", "prepare_user_record", "prepare_config_record", "service_identity", "prepare_fix_decision", "list_fix_proposals", "prepare_fix_withdrawal"]);
 /** The loop transitions that automate (contract §5): the custodian checks their session and connected process. */
 const AUTOMATION_KINDS: ReadonlySet<string> = new Set(["spend_continuation", "wake_arm", "wake_consume"]);
 /** P3.4C-3 (contract §3.5): the run transitions accepted only from the bound session's process tree. */
@@ -140,6 +140,7 @@ const ALLOWED_ARGS: Record<CustodianOp, readonly string[]> = {
   prepare_fix_decision: ["repositoryRoot", "runId", "operationId", "decision", "expectedRepoKey", "expectedProposalDigest", "expectedRenderingDigest"],
   render_fix_proposal: ["repositoryRoot", "runId", "operationId"],
   list_fix_proposals: ["repositoryRoot"],
+  prepare_fix_withdrawal: ["repositoryRoot", "runId", "operationId", "expectedRepoKey", "expectedConfirmationId", "expectedProposalDigest", "expectedRenderingDigest"],
   hold_evidence: ["repositoryRoot", "runId", "sha256", "part", "parts", "data"],
 };
 
@@ -199,7 +200,7 @@ interface SimGrant {
 }
 
 interface SimIntent {
-  action: "grant" | "revoke" | "user_record" | "config_record" | "fix_decision";
+  action: "grant" | "revoke" | "user_record" | "config_record" | "fix_decision" | "fix_withdrawal";
   args: Record<string, unknown>;
   repoKey: string;
   stateDigest: string;
@@ -598,6 +599,26 @@ export class SimulatedCustodianTransport implements CustodianTransport {
     return { held: true, proposalDigest: p.proposalDigest, paths: p.changes.map((c) => c.path), preimages: p.changes.map((c) => c.preimage) };
   }
 
+  /** TEST control (POST-1 Fix Withdraw W3): called after a request's preparatory reads and before its hold (HoldPoints.RunPreGate). */
+  preGateHookForTest: ((op: CustodianOp, args: Record<string, unknown>) => Promise<void>) | null = null;
+
+  /** TEST control (POST-1 Fix Withdraw W18): the content removal after a withdrawal fails (the content stays). */
+  deleteFaultForTest = false;
+
+  /** TEST control (POST-1 Fix Withdraw W16): the run's log filled to `count` events, each padding event carrying `bytes`. */
+  padRunEventsForTest(repositoryRoot: string, runId: string, count: number, bytes = 0): number {
+    const repoKey = this.identity(repositoryRoot).key;
+    return this.withState((st) => {
+      const run = (st.runs ??= {})[runKey(repoKey, runId)];
+      if (!run) throw new Error(`no run ${runId}`);
+      const filler = "x".repeat(bytes);
+      while (run.events.length < count) {
+        run.events.push({ seq: run.events.length + 1, kind: "respond", requestId: `pad-${run.events.length + 1}`, caller: "implementer", clientPid: null, requestDigest: "0".repeat(64), fromStatus: run.status, toStatus: run.status, at: new Date(this.now()).toISOString(), result: { padding: filler } });
+      }
+      return run.events.length;
+    });
+  }
+
   /** TEST control (Step 7.1): a run as a run opened before P3.4C-4 has it — no configuration pinned at its open. */
   unpinRunForTest(repositoryRoot: string, runId: string): void {
     const repoKey = this.identity(repositoryRoot).key;
@@ -684,6 +705,8 @@ export class SimulatedCustodianTransport implements CustodianTransport {
         return failFromError(e);
       }
     }
+    // POST-1 Fix Withdraw (W3; GrantLedger HoldPoints.RunPreGate): the preparatory reads are done and the hold is not taken.
+    if (this.preGateHookForTest) await this.preGateHookForTest(op, args);
     const res = this.withState((st) => this.handle(st, surface, op, args, requestId, observed));
     // P3.4C-5 Increment 4 (§3.2 retention), after the hold: retired exports removed; opening a run sweeps the export root.
     this.drainRetired();
@@ -985,6 +1008,8 @@ export class SimulatedCustodianTransport implements CustodianTransport {
         return this.prepareFixDecisionOp(st, args, requestId, observed.heldRead ?? null);
       case "render_fix_proposal":
         return this.renderFixProposalOp(st, args, observed.heldRead ?? null);
+      case "prepare_fix_withdrawal":
+        return this.prepareFixWithdrawalOp(st, args, requestId);
       case "list_fix_proposals":
         if (!observed.fixListing) throw simError("INTERNAL", "the listing was not built");
         if (observed.fixListing instanceof Error) throw observed.fixListing;
@@ -1127,6 +1152,28 @@ export class SimulatedCustodianTransport implements CustodianTransport {
     };
   }
 
+  /** POST-1 Fix Withdraw (GrantLedger.PrepareFixWithdrawal): prepare the withdrawal of a fix's current confirmation, located by
+   * the path or (a guided selection only) by the listed identity; nothing is recorded until commit. */
+  private prepareFixWithdrawalOp(st: SimState, args: Record<string, unknown>, requestId: string): Record<string, unknown> {
+    const runId = strictToken(args.runId, "runId", 128);
+    const operationId = strictToken(args.operationId, "operationId", 64);
+    if (args.repositoryRoot !== undefined && args.repositoryRoot !== null && typeof args.repositoryRoot !== "string") throw simError("INVALID_ARGUMENT", "'repositoryRoot' must be a string");
+    const expected = withdrawalSelectionOf(args);
+    let located: { key: string; canonicalPath: string | null };
+    if (typeof args.repositoryRoot === "string") {
+      const id = this.identity(args.repositoryRoot);
+      located = { key: id.key, canonicalPath: id.canonicalPath };
+    } else if (expected) located = { key: expected.repoKey, canonicalPath: null };
+    else throw simError("MALFORMED_REQUEST", "a withdrawal names the repository's path, or (a guided selection) all four expected values");
+    const prepared = prepareFixWithdrawal(this.runStoreOf(st), located, runId, operationId, requestId, expected, this.now());
+    this.assertRequestIdFree(st, requestId);
+    st.intents[requestId] = { action: FIX_WITHDRAWAL_ACTION, args: prepared.args, repoKey: located.key, stateDigest: prepared.stateDigest, expiresAtMs: this.now() + AUTH_TTL_MS, requestId };
+    return {
+      authorizationRequestId: requestId, action: FIX_WITHDRAWAL_ACTION, rendering: prepared.rendering, digest: "simulated", challenge: "simulated", expiresAt: new Date(this.now() + AUTH_TTL_MS).toISOString(),
+      fixWithdrawal: prepared.facts,
+    };
+  }
+
   /** Phase 4 Increment 3 (RenderFixProposal): the custodian's rendering of a proposal it holds (read only, both surfaces). */
   private renderFixProposalOp(st: SimState, args: Record<string, unknown>, read: SimHeldRead | null): Record<string, unknown> {
     const runId = strictToken(args.runId, "runId", 128);
@@ -1142,7 +1189,7 @@ export class SimulatedCustodianTransport implements CustodianTransport {
     return {
       operationId, status: read.status, proposalDigest: read.proposalDigest, expiresAt: (op.outcome?.["proposal"] as Record<string, unknown> | undefined)?.["expiresAt"] ?? null,
       rendering: read.rendering.text, renderingDigest: read.rendering.digest, changesDigest: read.rendering.changesDigest,
-      confirmation: c ? { confirmationId: c["confirmationId"] ?? null, decision: c["decision"] ?? null, expiresAt: c["expiresAt"] ?? null, consumedAt: c["consumedAt"] ?? null } : null,
+      confirmation: c ? { confirmationId: c["confirmationId"] ?? null, decision: c["decision"] ?? null, expiresAt: c["expiresAt"] ?? null, consumedAt: c["consumedAt"] ?? null, withdrawnAt: c["withdrawnAt"] ?? null } : null,
     };
   }
 
@@ -1168,7 +1215,16 @@ export class SimulatedCustodianTransport implements CustodianTransport {
         throw e;
       }
     }
-    const current = intent.action === "fix_decision" ? intent.stateDigest
+    if (intent.action === FIX_WITHDRAWAL_ACTION) {
+      // POST-1 Fix Withdraw (RequireFreshFixWithdrawal): a fix withdrawn, consumed or ended since the prepare refuses.
+      try {
+        requireFreshFixWithdrawal(this.runStoreOf(st), intent.args, intent.stateDigest);
+      } catch (e) {
+        delete st.intents[authorizationRequestId];
+        throw e;
+      }
+    }
+    const current = intent.action === "fix_decision" || intent.action === FIX_WITHDRAWAL_ACTION ? intent.stateDigest
       : intent.action === "user_record"
       ? this.userRecordStateDigest(st, intent.repoKey, String(intent.args.runId), String(intent.args.recordKind), intent.args.payload, intent.args.redactionBasis !== undefined)
       : intent.action === "config_record"
@@ -1195,6 +1251,10 @@ export class SimulatedCustodianTransport implements CustodianTransport {
     if (intent.action === "config_record") {
       const recordedBy = { role: "user", channel: "custodian_operator", assurance: "local_admin_elevation", proofDigest: "simulated", requestId: intent.requestId };
       return applyConfig((st.config ??= emptyConfig()), intent.args, intent.requestId, recordedBy, this.now());
+    }
+    if (intent.action === FIX_WITHDRAWAL_ACTION) {
+      const recordedBy = { role: "user", channel: "custodian_operator", assurance: "local_admin_elevation", proof_digest: "simulated", request_id: intent.requestId };
+      return applyFixWithdrawal(this.runStoreOf(st), intent.args, intent.requestId, recordedBy, this.now(), this.deleteFaultForTest);
     }
     if (intent.action === "fix_decision") {
       const recordedBy = { role: "user", channel: "custodian_operator", assurance: "local_admin_elevation", proof_digest: "simulated", request_id: intent.requestId };

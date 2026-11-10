@@ -71,6 +71,23 @@ internal static partial class RunSelfTest
         Response implementerSelection = core.Handle(CallerClass.Implementer, Req("prepare_fix_decision", Prep(new JsonObject { ["expectedRepoKey"] = key })), null, 4242);
         failed += Check("7.1: a malformed selection from the implementer surface is refused as the caller first (CALLER_NOT_AUTHORIZED)",
             !implementerSelection.Ok && implementerSelection.Code == ErrorCodes.CallerNotAuthorized);
+
+        // POST-1 Fix Withdraw (W10): the withdrawal is the operator's only; a guided one names all four expected values or none.
+        var withdrawal = new JsonObject { ["repositoryRoot"] = repo, ["runId"] = "r1", ["operationId"] = "fop-1-aaaaaaaaaaaa" };
+        foreach ((CallerClass who, string name) in new[] { (CallerClass.Implementer, "implementer"), (CallerClass.Helper, "helper") })
+        {
+            Response w = core.Handle(who, Req("prepare_fix_withdrawal", (JsonObject)withdrawal.DeepClone()), null, 4242);
+            failed += Check($"W10: prepare_fix_withdrawal on the {name} surface → CALLER_NOT_AUTHORIZED, nothing prepared", !w.Ok && w.Code == ErrorCodes.CallerNotAuthorized && w.Data is null);
+        }
+        var forgedWithdrawal = (JsonObject)withdrawal.DeepClone();
+        forgedWithdrawal["withdrawnBy"] = "operator";
+        Response fw = core.Handle(CallerClass.Operator, Req("prepare_fix_withdrawal", forgedWithdrawal), null);
+        failed += Check("W10: a withdrawal request carrying an authority-shaped field → MALFORMED_REQUEST", !fw.Ok && fw.Code == ErrorCodes.MalformedRequest);
+        var partial = (JsonObject)withdrawal.DeepClone();
+        partial["expectedRepoKey"] = key;
+        partial["expectedConfirmationId"] = "00000000-0000-4000-8000-000000000001";
+        Response pw = core.Handle(CallerClass.Operator, Req("prepare_fix_withdrawal", partial), null);
+        failed += Check("W9: prepare_fix_withdrawal with two of the four expected values → MALFORMED_REQUEST", !pw.Ok && pw.Code == ErrorCodes.MalformedRequest);
         return failed;
     }
 }

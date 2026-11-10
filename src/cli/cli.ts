@@ -35,7 +35,8 @@ import { selfOwner, classifyOwnerLiveness, OWNER_LIVENESS_DEPS } from "../store/
 import { clearWorktreeOwnership, readWorktreeLock, type WorktreeLockInfo } from "../store/locks.js";
 import { resolveNativeExecutable } from "../process/native-resolve.js";
 import { describeKind, resolveCommand, displayCommandLine, printable } from "../process/command.js";
-import { snapshotProcessTable, findDescendants } from "../process/proc-table.js";
+import { snapshotProcessTable, findDescendants, type ProcEntry } from "../process/proc-table.js";
+import { lockReleaseDecision } from "./lock-release-decision.js";
 import { buildChildEnv, lookupEnv } from "../process/env.js";
 import { ticksOfIdentity } from "../process/linux-proc.js";
 import { canonicalizePath, pathKey } from "../workspace/paths.js";
@@ -57,9 +58,10 @@ import { runLoopCli } from "./loop-commands.js";
 import { runConfigCli, runConfigProposeCli } from "./config-commands.js";
 import { runFixCli } from "./fix-commands.js";
 import { runSetupCli } from "./setup-commands.js";
-import { doctor, protectedDoctor } from "../engine/doctor.js";
-import { renderStatus } from "./setup-commands.js";
-import { ensurePrivateDataHome, gitExeOf, loadEngine } from "../engine/engine-env.js";
+import { doctor, doctorExitCode, notVerifiedRecords, protectedDoctor, type ProtectedDoctorFacts } from "../engine/doctor.js";
+import { RECORD_LABEL, renderStatus, repositoryOf } from "./setup-commands.js";
+import { fixEvidenceReader } from "./status-fix-evidence.js";
+import { ensurePrivateDataHome, loadEngine } from "../engine/engine-env.js";
 import { selfOwner as ownerForDoctor } from "../store/owner.js";
 import { readRepoProposals } from "../checks/proposals.js";
 import { assertOperatorCodeTrusted, isOperatorCommand } from "./operator-trust.js";
@@ -173,6 +175,7 @@ export const USAGE = [
   "  fix show       <run-id> [<proposal>] [--repo <path>]   (a delegated fix: the custodian's exact rendering of its proposal; with --repo, the run as the custodian holds it)",
   "  fix confirm    <run-id> <proposal> --repo <path>   (confirm exactly the rendered content, single use; operator, interactive)",
   "  fix reject     <run-id> <proposal> --repo <path>   (close the proposal; operator, interactive)",
+  "  fix withdraw   <run-id> <proposal> --repo <path>   (withdraw a confirmed fix's confirmation before it is applied: it can never be applied; operator, interactive)",
   "  fix reconcile  <run-id> [--restore | --leave]   (an interrupted application: report, then restore or leave and record it)",
   "  global options: --home <data dir>  --git <git executable>  --config <file>",
   "  exit codes: 0 ok, 1 error, 2 confirmation required, 3 cancellation requested but termination not confirmed, 4 the stop did not establish that no confirmed fix can run",
@@ -477,14 +480,26 @@ interface LockInspection {
   scanOk: boolean;
 }
 
-async function inspectLock(lock: WorktreeLockInfo): Promise<LockInspection> {
+/** The process-table snapshot `lock show` / `lock release` use. TEST ONLY: `engineTestHooks.checks.sweep.snapshot`
+ * scripts it (never set by the CLI's entry point, a flag, configuration or the environment). A snapshot that throws is
+ * unavailable, like one that returns null (F-N26-1), and so is one that does not list this very process: it is no view
+ * of the process table (Linux: an empty or hidden /proc reads as an empty list, not as a failure). */
+function lockSnapshot(io: CliIo): () => Promise<ProcEntry[] | null> {
+  const snap = io.engineTestHooks?.checks?.sweep?.snapshot ?? snapshotProcessTable;
+  return async () => {
+    const table = await snap().catch(() => null);
+    return table && table.some((e) => e.pid === process.pid) ? table : null;
+  };
+}
+
+async function inspectLock(lock: WorktreeLockInfo, snapshot: () => Promise<ProcEntry[] | null>): Promise<LockInspection> {
   const ownerLiveness = await classifyOwnerLiveness(lock.owner, OWNER_LIVENESS_DEPS);
   const liveChildren: LockInspection["liveChildren"] = [];
   for (const c of lock.children ?? []) {
     const l = await classifyOwnerLiveness({ serverInstanceId: "child", pid: c.pid, startedAtMs: c.startedAtMs, ...(c.startIdentity ? { startIdentity: c.startIdentity } : {}) }, { ...OWNER_LIVENESS_DEPS, toleranceMs: 3000 });
     if (l !== "dead") liveChildren.push({ pid: c.pid, command_line: c.command_line });
   }
-  const table = await snapshotProcessTable();
+  const table = await snapshot();
   const descendants: LockInspection["descendants"] = [];
   if (table) {
     for (const c of lock.children ?? []) {
@@ -517,7 +532,7 @@ async function lockShow(p: Parsed, io: CliIo): Promise<number> {
     io.out(`no worktree lock for ${rc.repoRoot}`);
     return 0;
   }
-  printInspection(io, await inspectLock(lock));
+  printInspection(io, await inspectLock(lock, lockSnapshot(io)));
   return 0;
 }
 
@@ -529,16 +544,21 @@ async function lockRelease(p: Parsed, io: CliIo): Promise<number> {
     io.out(`no worktree lock for ${rc.repoRoot}`);
     return 0;
   }
-  const x = await inspectLock(lock);
+  const x = await inspectLock(lock, lockSnapshot(io));
   printInspection(io, x);
-  if (!lock.ownership_unresolved && x.ownerLiveness !== "dead") {
-    io.err("the lock is held by a live (or unconfirmed) owner; it is not released. Stop that operation instead.");
+  const decision = lockReleaseDecision({
+    ownershipUnresolved: lock.ownership_unresolved === true,
+    ownerLiveness: x.ownerLiveness,
+    liveChildren: x.liveChildren.length,
+    descendants: x.descendants.length,
+    scanOk: x.scanOk,
+    force: has(p, "--force"),
+  });
+  if (!decision.proceed) {
+    io.err(decision.message);
     return 1;
   }
-  if ((x.liveChildren.length > 0 || x.descendants.length > 0) && !has(p, "--force")) {
-    io.err("processes started by the check are still running; end them first, or pass --force to release anyway");
-    return 1;
-  }
+  for (const w of decision.warnings) io.err(w);
   let ok = confirmMatches(one(p, "--confirm")?.replace(/-/g, ""), lock.operation_id.replace(/-/g, ""));
   if (!ok && io.prompt) ok = (await io.prompt(`Type the operation id (${lock.operation_id}) to release: `)).trim() === lock.operation_id;
   if (!ok) {
@@ -573,11 +593,13 @@ async function doctorCmd(p: Parsed, io: CliIo): Promise<number> {
   // Phase 6 Increment 3: --protected adds the custodian's state, the repository's operator records and the host facts.
   if (has(p, "--repo") && !has(p, "--protected")) throw new DomainError("INVALID_ARGUMENT", "doctor --repo needs --protected");
   const repoRaw = one(p, "--repo");
-  const prot = has(p, "--protected") ? await protectedDoctor(le, repoRaw ? await resolveGitTopLevel(await canonicalizePath(repoRaw), { gitExe: await gitExeOf(le) }) : null) : null;
-  const ok = r.ok && (!prot || prot.problems.length === 0);
+  // The repository as `status` and `setup` name it (repositoryOf): on Linux, an operator who cannot resolve it locally
+  // (an untraversable home, Git's ownership check) passes the plain path, and the custodian resolves its identity.
+  const prot = has(p, "--protected") ? await protectedDoctor(le, repoRaw ? await repositoryOf(le, repoRaw) : null, fixEvidenceReader(le)) : null;
+  const { code, ok, headline } = doctorOutcome(r, prot);
   if (has(p, "--json")) {
     io.out(JSON.stringify(prot ? { ...r, ok, protected: prot } : r, null, 2));
-    return ok ? 0 : 1;
+    return code;
   }
   io.out(`code-parley ${r.tool_version} — node ${r.node.version} (${r.node.exec_path}), ${r.node.platform}`);
   io.out(`data home: ${r.data_home.path}${r.data_home.localappdata_fallback ? " (LOCALAPPDATA missing: USERPROFILE fallback)" : ""}${r.data_home.exists ? "" : " (not created yet)"}`);
@@ -601,8 +623,20 @@ async function doctorCmd(p: Parsed, io: CliIo): Promise<number> {
     if (prot.readers_grant) io.out(`repository readers grant: ${prot.readers_grant.present === null ? "unknown" : prot.readers_grant.present ? "present" : "MISSING"} (${prot.readers_grant.detail})`);
     if (prot.linux) io.out(`linux: admitted filesystems ${prot.linux.admitted_filesystems ?? "unknown"}; Codex bubblewrap AppArmor profile file ${prot.linux.apparmor_profile_file ? "installed" : "not installed"}`);
     for (const pr of prot.problems) io.out(`PROBLEM: ${pr}`);
+    for (const nv of prot.not_verified) io.out(`NOT VERIFIED from this account: ${nv}`);
   }
+  io.out(headline);
+  return code;
+}
+
+/** N-4: `doctor`'s outcome. Problems → 1; with none, a required record not verified from this account → 3, whose
+ * headline says NOT VERIFIED and names the records (never "doctor: OK"); else 0. `ok` is true only for 0. */
+export function doctorOutcome(r: { ok: boolean; problems: string[] }, prot: ProtectedDoctorFacts | null): { code: 0 | 1 | 3; ok: boolean; headline: string } {
   const count = r.problems.length + (prot?.problems.length ?? 0);
-  io.out(ok ? "doctor: OK" : `doctor: ${count} problem(s)`);
-  return ok ? 0 : 1;
+  const code = doctorExitCode(r.ok ? count : Math.max(count, 1), prot?.not_verified.length ?? 0);
+  if (code === 3) {
+    const labels = notVerifiedRecords(prot!.status).map((x) => RECORD_LABEL[x.record]);
+    return { code, ok: false, headline: `doctor: NOT VERIFIED from this account: ${labels.join(", ")} (no problem found; the protected state is not established here: see the NOT VERIFIED lines)` };
+  }
+  return { code, ok: code === 0, headline: code === 0 ? "doctor: OK" : `doctor: ${count} problem(s)` };
 }

@@ -71,6 +71,11 @@ internal static class HoldPoints
     internal const string CommitFresh = "commit:fresh";
     /// <summary>A <c>run_transition</c> was computed; it is about to be written (suffix: the kind).</summary>
     internal const string RunApplied = "run:applied:";
+    /// <summary>POST-1 Fix Withdraw: a withdrawal's commit was checked; its run record is about to be written.</summary>
+    internal const string FixWithdrawalWrite = "fix:withdrawal:write";
+    /// <summary>A <c>run_transition</c>'s preparatory reads (outside the gate) are done; the gate is NOT held (suffix: the
+    /// kind). The one hold point outside the lock: the corpus commits another transition here to fix an interleaving.</summary>
+    internal const string RunPreGate = "run:pregate:";
 }
 
 /// <summary>
@@ -222,6 +227,13 @@ internal sealed partial class GrantLedger
                 try { RequireFreshFixDecision(args, recordedState, rerendered, _clock()); }
                 catch (CustodianRefusal) { TryDelete(path); throw; }
             }
+            // POST-1 Fix Withdraw: a withdrawal's commit re-derives its own state; a fix withdrawn, consumed or ended since the
+            // prepare refuses (this commit records nothing).
+            else if (action == FixWithdrawalAction)
+            {
+                try { RequireFreshFixWithdrawal(args, recordedState); }
+                catch (CustodianRefusal) { TryDelete(path); throw; }
+            }
             else if (CurrentStateDigest(action, args, repoKey) != recordedState)
             {
                 TryDelete(path);
@@ -241,15 +253,22 @@ internal sealed partial class GrantLedger
             }
             Hold(HoldPoints.CommitFresh); // the freshness checks and the write below are one hold (§2.5 S5)
 
-            JsonObject result = action switch
+            JsonObject result;
+            try
             {
-                "grant" => ApplyGrant(args, requestId, recordedDigest, proofDigestFromClient),
-                "revoke" => ApplyRevoke(repoKey),
-                "user_record" => ApplyUserRecord(args, requestId, recordedDigest, proofDigestFromClient),
-                ConfigRecordAction => ApplyConfigRecord(args, requestId, recordedDigest, proofDigestFromClient),
-                FixDecisionAction => ApplyFixDecision(args, requestId, recordedDigest, proofDigestFromClient),
-                _ => throw new InvalidOperationException($"unknown action '{action}'"),
-            };
+                result = action switch
+                {
+                    "grant" => ApplyGrant(args, requestId, recordedDigest, proofDigestFromClient),
+                    "revoke" => ApplyRevoke(repoKey),
+                    "user_record" => ApplyUserRecord(args, requestId, recordedDigest, proofDigestFromClient),
+                    ConfigRecordAction => ApplyConfigRecord(args, requestId, recordedDigest, proofDigestFromClient),
+                    FixDecisionAction => ApplyFixDecision(args, requestId, recordedDigest, proofDigestFromClient),
+                    FixWithdrawalAction => ApplyFixWithdrawal(args, requestId, recordedDigest, proofDigestFromClient),
+                    _ => throw new InvalidOperationException($"unknown action '{action}'"),
+                };
+            }
+            // A fix decision or withdrawal refused at its write (the run's log or size cap) is spent: nothing was recorded.
+            catch (CustodianRefusal) when (action is FixDecisionAction or FixWithdrawalAction) { TryDelete(path); throw; }
             TryDelete(path);
             return result;
         }

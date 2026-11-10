@@ -89,7 +89,8 @@ describe.skipIf(!supported)("Step 7.1: fix review, the guided decision (simulate
     const prepare = f.custodian.received.find((r) => r.op === "prepare_fix_decision")!;
     expect(Object.keys(prepare.args).filter((k) => k.startsWith("expected")).sort()).toEqual(["expectedProposalDigest", "expectedRenderingDigest", "expectedRepoKey"]);
     // After the decision the listing is read again: the fix now waits for the session.
-    expect(out).toMatch(/ +- .*confirmed, waiting for the session to apply it/);
+    // POST-1 Fix Withdraw: a confirmed fix is now numbered too, offered for withdrawal only.
+    expect(out).toMatch(/^ +1 {2}.*confirmed, waiting for the session to apply it.*; you can withdraw it/m);
     const applied = await applyFix(f.le, run, { proposal_id: op });
     expect(applied.status, JSON.stringify(applied)).toBe("applied");
     expect(await math(f)).toBe(MATH_V1);

@@ -50,6 +50,22 @@ export type IsolationDecision =
   | { ok: true; isolation: EffectiveIsolation; argv: IsolationArgvInput }
   | { ok: false; reasons: string[]; missingSelfTests: SandboxBackend[] };
 
+/**
+ * Whether an acceptance of reduced isolation applies to a review on `backend` with Codex `codexVersion`: the rule the
+ * decision below applies (not revoked, this backend, the version within its range, the current statement, both accepted
+ * capabilities). `protected-status` reads the same rule, so a display never counts an acceptance enforcement would not.
+ */
+export function acceptanceApplies(a: IsolationAcceptance, backend: SandboxBackend, codexVersion: string): boolean {
+  return (
+    a.revoked_at === null &&
+    a.backend === backend &&
+    codexVersion.startsWith(a.codex_version_range) &&
+    a.statement_sha256 === REDUCED_ISOLATION_STATEMENT_SHA256 &&
+    a.accepted.includes("unrestricted_reads") &&
+    a.accepted.includes("advisory_network")
+  );
+}
+
 export function decideIsolation(i: IsolationDecisionInput): IsolationDecision {
   const reasons: string[] = [];
   const missing: SandboxBackend[] = [];
@@ -100,15 +116,7 @@ export function decideIsolation(i: IsolationDecisionInput): IsolationDecision {
 
   // Reduced isolation only with an explicit, current acceptance (never automatic, F1).
   for (const backend of i.backends) {
-    const acc = i.acceptances.find(
-      (a) =>
-        a.revoked_at === null &&
-        a.backend === backend &&
-        i.codexVersion.startsWith(a.codex_version_range) &&
-        a.statement_sha256 === REDUCED_ISOLATION_STATEMENT_SHA256 &&
-        a.accepted.includes("unrestricted_reads") &&
-        a.accepted.includes("advisory_network"),
-    );
+    const acc = i.acceptances.find((a) => acceptanceApplies(a, backend, i.codexVersion));
     if (!acc) continue;
     const argv: IsolationArgvInput = { mode: "S2", backend, installDir: i.installDir, webSearchDisabledValue: i.compat.webSearchDisabledValue, acceptanceId: acc.acceptance_id };
     return {

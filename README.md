@@ -766,7 +766,7 @@ Observed with Claude Code 2.1.286 and 2.1.289 and Claude Desktop 2.19675.0 (MSIX
 ## CLI reference
 
 `code-parley help` prints the same list. On Linux the operator runs the operator commands (`setup`,
-`decide`, `amend`, `loop`, `config`, `fix review`, `fix confirm`, `fix reject`, `runs stop --repo`) through
+`decide`, `amend`, `loop`, `config`, `fix review`, `fix confirm`, `fix reject`, `fix withdraw`, `runs stop --repo`) through
 `/usr/local/sbin/code-parley-operator`, by that absolute path; on Windows the operator runs them as
 `code-parley` in an elevated terminal. `config propose` and `config propose-selftest` are the
 implementer's.
@@ -844,6 +844,7 @@ Delegated fixes
   fix show       <run-id> [<proposal>] [--repo <path>]
   fix confirm    <run-id> <proposal> --repo <path>
   fix reject     <run-id> <proposal> --repo <path>
+  fix withdraw   <run-id> <proposal> --repo <path>
   fix reconcile  <run-id> [--restore | --leave]
 
 Global options: --home <data dir>  --git <git executable>  --config <file>
@@ -875,9 +876,9 @@ CI (`.github/workflows/ci.yml`) runs these on Windows and Linux with Node 26, th
 Node.js major, for pull requests into any branch, pushes to `main` and manual runs
 (`gh workflow run CI --ref <branch>`): the same nine jobs every time. A new commit on a pull request, or
 a new manual run on the same branch, cancels the older run; a later merge does not cancel a `main`
-run. Plain branch pushes and documentation-only changes (Markdown at the repository root and in
-`docs/`; not `prompts/`, which holds the product's reviewer prompt) do not start
-it. Both platforms are gates: each runs the platform-independent tests, the shared contracts
+run. Plain branch pushes and documentation-only pushes to `main` (Markdown at the repository root and in
+`docs/`; not `prompts/`, which holds the product's reviewer prompt) do not start it; every pull
+request does, documentation-only ones included, because `main` requires these checks. Both platforms are gates: each runs the platform-independent tests, the shared contracts
 and its own platform's integration suites (real repositories, processes, links, the server over
 stdio); the other platform's are reported as skipped
 ([docs/development.md](docs/development.md#test-classes)). Each platform and Node.js version

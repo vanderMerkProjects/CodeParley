@@ -53,6 +53,15 @@ describe("Phase 6 Increment 3 — the remediation catalog (the tested table)", (
     expect(remedyFor("CUSTODIAN_UNAVAILABLE", "win32", "no pipe")?.cause).toMatch(/no trusted answer/);
   });
 
+  it("PR #9 review (CodeRabbit): an expired or withdrawn confirmation is never confirmed again, as docs/troubleshooting.md says", () => {
+    for (const p of ["win32", "linux"] as const) {
+      const expired = remedyFor("CONFIRMATION_EXPIRED", p)!;
+      expect(expired.fix, p).not.toMatch(/fix confirm/);
+      expect(expired.fix, p).toMatch(/^delegate the fix again; the operator can withdraw the expired confirmation: `.* fix withdraw <run> <proposal> --repo <path>`/);
+      expect(remedyFor("CONFIRMATION_WITHDRAWN", p)).toEqual({ cause: "the operator withdrew the confirmation of this delegated fix; it can never be applied", fix: "delegate the fix again if it is still wanted" });
+    }
+  });
+
   it("platform wording: no Windows command on Linux, no Linux command on Windows", () => {
     for (const code of REMEDY_CODES) {
       const lin = remedyFor(code, "linux")!;

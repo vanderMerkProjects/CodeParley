@@ -55,7 +55,9 @@ describe("Phase 5 G-OP: the operator code check", () => {
   });
 
   it("the operator commands are exactly those on the custodian's operator surface", () => {
-    for (const [g, c] of [["decide", undefined], ["amend", "x"], ["loop", "allow"], ["loop", "grants"], ["config", "set"], ["fix", "confirm"], ["fix", "reject"]] as const) expect(isOperatorCommand(g, c), `${g} ${c}`).toBe(true);
+    for (const [g, c] of [["decide", undefined], ["amend", "x"], ["loop", "allow"], ["loop", "grants"], ["config", "set"], ["fix", "confirm"], ["fix", "reject"], ["fix", "review"], ["fix", "withdraw"]] as const) expect(isOperatorCommand(g, c), `${g} ${c}`).toBe(true);
+    // POST-1 Fix Withdraw (F-W1, W19): `fix review` decides fixes and `fix withdraw` withdraws one, so on Linux the operator-code
+    // trust check (the installed runtime, not an implementer-writable copy) runs before either reaches the custodian.
     for (const [g, c] of [["fix", "show"], ["fix", "reconcile"], ["runs", "list"], ["checks", "approve"], ["doctor", undefined], ["codex", "selftest"], ["config", "propose"], ["config", "propose-selftest"]] as const) expect(isOperatorCommand(g, c), `${g} ${c}`).toBe(false);
     // TD, candidate 3: only `runs stop` with --repo is the operator's; the implementer keeps every other `runs` form.
     expect(isOperatorCommand("runs", "stop", true)).toBe(true);

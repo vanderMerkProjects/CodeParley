@@ -537,7 +537,7 @@ const applyFixTool: ToolSpec<typeof ApplyFixToolInput> = {
   def: {
     title: "Apply an owner-confirmed fix",
     description:
-      "Apply the OWNER-CONFIRMED proposal of a delegated fix (proposal_id: the fix's id from delegate_fix / get_review_status fixes) to the worktree. The custodian consumes the owner's single-use confirmation — refused without one (FIX_NOT_CONFIRMED), after a rejection (FIX_DECLINED), expiry (CONFIRMATION_EXPIRED) or a previous application (CONFIRMATION_CONSUMED) — re-measures the worktree against the fix's baseline (FIX_STALE: nothing written, the confirmation unused) and hands back exactly the confirmed content. " +
+      "Apply the OWNER-CONFIRMED proposal of a delegated fix (proposal_id: the fix's id from delegate_fix / get_review_status fixes) to the worktree. The custodian consumes the owner's single-use confirmation — refused without one (FIX_NOT_CONFIRMED), after a rejection (FIX_DECLINED), expiry (CONFIRMATION_EXPIRED), the owner's withdrawal (CONFIRMATION_WITHDRAWN) or a previous application (CONFIRMATION_CONSUMED) — re-measures the worktree against the fix's baseline (FIX_STALE: nothing written, the confirmation unused) and hands back exactly the confirmed content. " +
       "Every target is checked at use (no link or junction on its way, the preimage unchanged, an added path absent); only that content is written, one file at a time (no atomic multi-file write is claimed); a failure restores what was written (apply_failed). The result is never `ready`: run fresh checks and request a distinct review (review_with_codex) afterwards. It takes no contents, diff or confirmation.",
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },

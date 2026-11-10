@@ -11,7 +11,7 @@ import { appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { gzipSync } from "node:zlib";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { git, initRepo, tempDir, writeFiles } from "./helpers/git-fixture.js";
 
 interface Pins { primary: string; subkeys: { fpr: string; current: boolean }[] }
@@ -26,14 +26,19 @@ const lib = (await import(new URL("../scripts/package/lib/release-verify.mjs", i
   pinProblems(p: unknown): string[]; signatureStatusProblems(s: string, code: number | null, p: Pins, keys?: Key[], o?: { expectSubkey?: string }): string[];
   verifyDetached(o: { gpg: string; keyArmored: string; pins: Pins; signatureFile: string; dataFile: string }): { problems: string[]; keyExpired: boolean };
   releaseKeyProblems(keys: Key[], pins: Pins, o?: { forSigning?: boolean; now?: number }): string[];
-  RELEASE_KEY: Pins & { file: string };
+  RELEASE_KEY: Pins & { file: string }; COMMIT_KEY: { primary: string; file: string }; MAIN_REF: string;
+  integrationOf(o: { repo: string; commit: string; mainRef?: string }): Integration;
+  releaseSourceProblems(o: SourceArgs & { rehearsal?: boolean }): { problems: string[]; integration: Integration | null };
+  stagingSourceGate(o: SourceArgs & { dirty: boolean; signature: string; testBuild: boolean }): { required: boolean; problems: string[]; integration: Integration | null; why: string };
 };
+interface Integration { problems: string[]; main: string | null; merge: string | null; tree: string | null }
+interface SourceArgs { repo: string; commit: string; version: string; gpg: string; pins: Pins; commitPin: string; mainRef?: string }
 const manifestLib = (await import(new URL("../scripts/package/lib/release-manifest.mjs", import.meta.url).href)) as {
   ARTIFACTS: { name: string }[]; buildId(i: Record<string, unknown>): Record<string, unknown>; buildManifest(i: Record<string, unknown>): Record<string, unknown> & { artifacts: { file: string }[] };
 };
-const { prepare } = (await import(new URL("../scripts/package/prepare-signing.mjs", import.meta.url).href)) as { prepare(argv: string[], deps: { pins: Pins; repo: string; log: Log; now?: number }): number };
+const { prepare } = (await import(new URL("../scripts/package/prepare-signing.mjs", import.meta.url).href)) as { prepare(argv: string[], deps: { pins: Pins; commitPin: string; repo: string; log: Log; now?: number }): number };
 const { verify } = (await import(new URL("../scripts/package/verify-release.mjs", import.meta.url).href)) as {
-  verify(argv: string[], deps: { pins: Pins; repoPin?: { name: string; id: number }; github?: (p: string) => unknown; log: Log }): number;
+  verify(argv: string[], deps: { pins: Pins; commitPin: string; repoPin?: { name: string; id: number }; github?: (p: string) => unknown; log: Log }): number;
 };
 
 const root = join(fileURLToPath(new URL(".", import.meta.url)), "..");
@@ -80,7 +85,9 @@ const LATER = "20300101T000000"; // long after the disposable subkeys' one-day e
 let base = "";
 let home = "";
 let repo = "";
-const c = { commit: "", other: "", rotated: "" };
+// c.main0, c.merge1, c.merge2: the fixture's main (refs/remotes/origin/main = c.merge2), as GitHub builds it: main before
+// the milestone, then the GitHub merge of c.commit (the owner-signed release source) and the GitHub merge of c.rotated.
+const c = { commit: "", other: "", rotated: "", main0: "", merge1: "", merge2: "" };
 const keys = { commit: "", release: "", releaseSub: "", releaseSub2: "", stranger: "", strangerSub: "", expiring: "", expiringSub: "" };
 const pub: Record<string, string> = {};
 
@@ -168,18 +175,18 @@ const args = (dir: string, digest: string, o: RunOptions = {}) => [
 ];
 const runPrepare = (staged: string, out: string, digest: string, o: RunOptions = {}) => {
   const q = quiet();
-  const code = prepare(["--staged", staged, "--out", out, ...args("", digest, o)], { pins: o.pins ?? P1(), repo, log: q.log, ...(o.now ? { now: o.now } : {}) });
+  const code = prepare(["--staged", staged, "--out", out, ...args("", digest, o)], { pins: o.pins ?? P1(), commitPin: keys.commit, repo, log: q.log, ...(o.now ? { now: o.now } : {}) });
   return { code, out: q.text() };
 };
 const noNetwork = () => { throw new Error("no network in this test"); };
 const runVerify = (step: string, dir: string, digest: string, o: RunOptions = {}) => {
   const q = quiet();
-  const code = verify([step, ...args(dir, digest, o), "--repo", repo, ...(o.published ? ["--published"] : [])], { pins: o.pins ?? P1(), repoPin: { name: "example/CodeParley", id: 42 }, github: o.github ?? noNetwork, log: q.log });
+  const code = verify([step, ...args(dir, digest, o), "--repo", repo, ...(o.published ? ["--published"] : [])], { pins: o.pins ?? P1(), commitPin: keys.commit, repoPin: { name: "example/CodeParley", id: 42 }, github: o.github ?? noNetwork, log: q.log });
   return { code, out: q.text() };
 };
 const report = (pkg: string, digest: string, o: RunOptions = {}) => {
   const q = quiet();
-  expect(verify(["report", ...args(pkg, digest, o), "--repo", repo], { pins: o.pins ?? P1(), log: q.log })).toBe(0);
+  expect(verify(["report", ...args(pkg, digest, o), "--repo", repo], { pins: o.pins ?? P1(), commitPin: keys.commit, log: q.log })).toBe(0);
   return readFileSync(join(pkg, "RELEASE-REPORT.md"), "utf8");
 };
 const row = (md: string, step: string) => md.split("\n").find((l) => l.startsWith(`| ${step} |`)) ?? "";
@@ -201,6 +208,21 @@ const tag = (name: string, target: string, message: string, key = keys.releaseSu
   git(repo, ["-c", `gpg.program=${gpgProgram()}`, "-c", `user.signingkey=${key}!`, "tag", "-s", name, target, "-F", msg], { env: gitEnv() });
 };
 const remove = (name: string) => git(repo, ["tag", "-d", name], { allowFail: true });
+const GITHUB = "GitHub <noreply@github.com>";
+let at = 1794079200;
+/** A raw commit object, written as GitHub writes a web merge (C-1 research, D-107): unsigned here, since the release
+ *  contract never verifies GitHub's own signature; `committer` makes the other shapes. */
+const rawCommit = (tree: string, parents: string[], committer = GITHUB, msg = "Merge pull request #9 from example/milestone") =>
+  git(repo, ["hash-object", "-t", "commit", "-w", "--stdin"], { input: `tree ${tree}\n${parents.map((p) => `parent ${p}\n`).join("")}author Fixture <fixture@example.invalid> ${++at} +0000\ncommitter ${committer} ${at} +0000\n\n${msg}\n` }).stdout.trim();
+const treeOf = (commit: string) => git(repo, ["rev-parse", `${commit}^{tree}`]).stdout.trim();
+/** A GitHub merge of `head` into `main`, with `head`'s tree (the milestone contains main). */
+const githubMerge = (main: string, head: string, tree = treeOf(head)) => rawCommit(tree, [main, head]);
+const setMain = (sha: string | null, ref = "refs/remotes/origin/main") => (sha ? git(repo, ["update-ref", ref, sha]) : git(repo, ["update-ref", "-d", ref]));
+/** Run `fn` with the clone's fetched main at `sha`, then put the fixture's main back. */
+const withMain = <T>(sha: string | null, fn: () => T): T => {
+  setMain(sha);
+  try { return fn(); } finally { setMain(c.merge2); }
+};
 
 describe("Step 4: release-signing workflow, with disposable keys", { timeout: 180_000 }, () => {
   // A skip carries its reason on every test; a broken GnuPG fails every test (in beforeAll, vitest would list them as
@@ -244,6 +266,11 @@ describe("Step 4: release-signing workflow, with disposable keys", { timeout: 18
     c.commit = await signed({ "package.json": `${JSON.stringify({ name: "code-parley", version: VERSION })}\n`, ".github/ci/commit-signing-key.asc": pub.commit, "docs/codeparley-release-key.asc": pub.releaseA! }, "release source");
     c.other = await signed({}, "a later commit");
     c.rotated = await signed({ "package.json": `${JSON.stringify({ name: "code-parley", version: ROTATED })}\n`, "docs/codeparley-release-key.asc": pub.releaseB! }, "rotate the release signing subkey");
+    // main, as GitHub builds it: it merged c.commit's pull request, then (main moved on) c.rotated's.
+    c.main0 = rawCommit(git(repo, ["hash-object", "-t", "tree", "-w", "--stdin"], { input: "" }).stdout.trim(), [], "Fixture <fixture@example.invalid>", "main before the milestone");
+    c.merge1 = githubMerge(c.main0, c.commit);
+    c.merge2 = githubMerge(c.merge1, c.rotated);
+    setMain(c.merge2);
   });
 
   afterAll(() => {
@@ -365,7 +392,7 @@ describe("Step 4: release-signing workflow, with disposable keys", { timeout: 18
       for (const drop of ["--version", "--commit", "--manifest-sha256"]) {
         const argv = ["package", ...args(pkg, digest), "--repo", repo];
         argv.splice(argv.indexOf(drop), 2);
-        expect(() => verify(argv, { pins: P1(), log: () => undefined }), drop).toThrow(/must be/);
+        expect(() => verify(argv, { pins: P1(), commitPin: keys.commit, log: () => undefined }), drop).toThrow(/must be/);
       }
       // A package changed consistently (a new manifest and a request that names it) still fails against the TD's digest.
       const forged = `${pkg}-forged`;
@@ -595,6 +622,186 @@ describe("Step 4: release-signing workflow, with disposable keys", { timeout: 18
   });
 
   // C-5: approved-subkey history, expiry, rotation, revocation.
+  // C-1 (D-107, workflow §9): the release source is the owner-signed head of the merged pull request, never GitHub's
+  // merge commit, and it must be integrated into the fetched main by that merge. Every main below is built in this
+  // disposable fixture's object store; no real history is touched.
+  describe("C-1: the release source and its integration into main", () => {
+    const x = { unmerged: "", unsigned: "", strangerSigned: "", foreignKey: "" };
+    const src = (commit: string, o: { version?: string; mainRef?: string; commitPin?: string } = {}) =>
+      lib.releaseSourceProblems({ repo, commit, version: o.version ?? VERSION, gpg, pins: P1(), commitPin: o.commitPin ?? keys.commit, ...(o.mainRef ? { mainRef: o.mainRef } : {}) });
+    const integration = (commit: string, main?: string) => (main === undefined ? lib.integrationOf({ repo, commit }) : withMain(main, () => lib.integrationOf({ repo, commit })));
+    const gate = (commit: string, o: { dirty?: boolean; signature?: string; testBuild?: boolean; version?: string } = {}) =>
+      lib.stagingSourceGate({ repo, commit, version: o.version ?? ROTATED, gpg, pins: P1(), commitPin: keys.commit, dirty: o.dirty ?? false, signature: o.signature ?? "verified", testBuild: o.testBuild ?? false });
+    const MAIN = "refs/remotes/origin/main";
+
+    beforeAll(() => {
+      if (support.skip || support.broken) return;
+      const commit = (msg: string, key: string | null, files: Record<string, string> = {}) => {
+        for (const [p, t] of Object.entries(files)) writeFileSync(join(repo, ...p.split("/")), t);
+        git(repo, ["add", "-A"]);
+        git(repo, [...(key ? ["-c", `gpg.program=${gpgProgram()}`, "-c", `user.signingkey=${key}`] : []), "commit", "-q", ...(key ? ["-S"] : []), "--allow-empty", "-m", msg], { env: gitEnv() });
+        return git(repo, ["rev-parse", "HEAD"]).stdout.trim();
+      };
+      x.unmerged = commit("an owner-signed head that no pull request merged yet", keys.commit);
+      x.unsigned = commit("an unsigned commit", null);
+      x.strangerSigned = commit("signed by a stranger, the owner's key file kept", `${keys.strangerSub}!`);
+      x.foreignKey = commit("signed by a stranger, who also replaced the key file", `${keys.strangerSub}!`, { ".github/ci/commit-signing-key.asc": g(["--armor", "--export", keys.stranger]) });
+    });
+
+    it("accepts the owner-signed head its GitHub merge integrated, at main's tip and after main moved on through later merges", () => {
+      expect(lib.MAIN_REF).toBe(MAIN);
+      expect(lib.COMMIT_KEY.primary).toBe("261E3060E70B4904615F17BD026A2C3E92B42B25");
+      // main moved on: c.merge2 (c.rotated's merge) is on top of c.merge1, which integrated c.commit.
+      expect(integration(c.commit)).toEqual({ problems: [], main: c.merge2, merge: c.merge1, tree: treeOf(c.commit) });
+      expect(integration(c.rotated)).toEqual({ problems: [], main: c.merge2, merge: c.merge2, tree: treeOf(c.rotated) });
+      expect(integration(c.commit, c.merge1)).toMatchObject({ problems: [], main: c.merge1, merge: c.merge1 }); // the merge is main's tip
+      expect(src(c.commit)).toMatchObject({ problems: [], integration: { merge: c.merge1 } });
+      const { pkg, digest } = prepared();
+      const r = runVerify("package", pkg, digest);
+      expect(r.code, r.out).toBe(0);
+      expect(r.out).toContain(`integrated into ${MAIN} (${c.merge2}) by the GitHub merge ${c.merge1}: second parent the source, the same tree ${treeOf(c.commit)}`);
+      expect(JSON.parse(readFileSync(join(pkg, "verified-package.json"), "utf8"))).toMatchObject({ schema: "codeparley.release-verification.v3", details: { releaseSource: { required: true, mainRef: MAIN, main: c.merge2, merge: c.merge1, tree: treeOf(c.commit) } } });
+      expect(report(pkg, digest)).toContain(`| Integrated into main by | the GitHub merge \`${c.merge1}\` (its second parent is the source; the same tree) |`);
+    });
+
+    it("refuses GitHub's merge commit as the release source", () => {
+      const r = src(c.merge1);
+      expect(r.problems).toContain(`commit ${c.merge1} is not signed by the owner's pinned commit key ${keys.commit} (signature N by no key)`);
+      expect(r.problems).toContain(`the release source ${c.merge1} is on ${MAIN}'s first-parent line itself: it reached main without a merge (pushed or fast-forwarded), so no pull-request merge integrated it`);
+      // Its manifest and request would name the merge; preparing it fails on the same checks.
+      const dir = join(base, `case-${++n}`);
+      const digest = stage(join(dir, "staged"), { commit: c.merge1 });
+      const p = runPrepare(join(dir, "staged"), join(dir, "pkg"), digest, { commit: c.merge1 });
+      expect(p.code).toBe(1);
+      expect(p.out).toContain(`commit ${c.merge1} is not signed by the owner's pinned commit key`);
+      expect(p.out).toContain("is on refs/remotes/origin/main's first-parent line itself");
+      expect(existsSync(join(dir, "pkg"))).toBe(false);
+    });
+
+    it("refuses a source that the fetched main does not reach", () => {
+      expect(integration(x.unmerged).problems).toEqual([`the release source ${x.unmerged} is not reachable from ${MAIN} (${c.merge2}): it is not integrated into main, or the clone's main is stale (fetch origin)`]);
+      expect(src(x.unmerged, { version: ROTATED }).problems).toHaveLength(1); // the signature is the owner's; only the integration is missing
+    });
+
+    it("refuses a merge that merged another commit, or merged the source in another position or shape", () => {
+      // The milestone moved on after the accepted head: the merge's second parent is a later commit (c.other).
+      expect(integration(c.commit, githubMerge(c.main0, c.other)).problems).toEqual([`no merge on ${MAIN}'s first-parent line merged the release source ${c.commit} itself: it is reachable from main only inside another merged commit (the merged pull request's head is a different commit)`]);
+      // The source as the FIRST parent: it is on main's first-parent line (the T7 shape).
+      expect(integration(c.commit, githubMerge(c.commit, c.main0, treeOf(c.commit))).problems[0]).toContain("is on refs/remotes/origin/main's first-parent line itself");
+      // An octopus merge carrying the source as its third parent.
+      const octopus = rawCommit(treeOf(c.commit), [c.main0, c.other, c.commit]);
+      expect(integration(c.commit, octopus).problems).toEqual([`${octopus} merges the release source, but not as the second of exactly two parents (parents ${c.main0}, ${c.other}, ${c.commit})`]);
+      // The right parents and tree, but not made by GitHub: a merge pushed by someone.
+      const pushed = rawCommit(treeOf(c.commit), [c.main0, c.commit], "Andries <owner@example.invalid>");
+      expect(integration(c.commit, pushed).problems).toEqual([`${pushed} merges the release source, but is committed by Andries (owner@example.invalid), not GitHub (noreply@github.com): not a pull-request merge made by GitHub`]);
+    });
+
+    it("refuses an integrating merge whose tree is not the source's", () => {
+      const conflict = githubMerge(c.main0, c.commit, treeOf(c.rotated));
+      expect(integration(c.commit, conflict)).toMatchObject({ merge: null, problems: [`the integrating merge ${conflict} has the tree ${treeOf(c.rotated)}, not the release source's tree ${treeOf(c.commit)}: main did not receive exactly the source`] });
+    });
+
+    it("refuses a main whose tip is not a merge, or that moved on through anything but GitHub merges", () => {
+      // The source pushed or fast-forwarded to main: main's tip is the source itself (T8).
+      expect(integration(c.commit, c.commit).problems[0]).toContain(`the release source ${c.commit} is on ${MAIN}'s first-parent line itself`);
+      // A non-merge commit on top of the integrating merge.
+      const direct = rawCommit(treeOf(c.commit), [c.merge1], "Andries <owner@example.invalid>", "a direct push");
+      expect(integration(c.commit, direct)).toMatchObject({ merge: null, problems: [`main moved on after the integrating merge ${c.merge1} through ${direct}, which is not a GitHub merge (1 parent(s), committer Andries (owner@example.invalid)): main's history since the integration is not verifiable`] });
+      // A later merge that GitHub did not make.
+      const pushed = rawCommit(treeOf(c.rotated), [c.merge1, c.rotated], "Andries <owner@example.invalid>");
+      expect(integration(c.commit, pushed).problems[0]).toContain(`through ${pushed}, which is not a GitHub merge (2 parent(s)`);
+      // A later GitHub merge is the legitimate way main moves on.
+      expect(integration(c.commit, githubMerge(c.merge2, x.unmerged)).merge).toBe(c.merge1);
+    });
+
+    it("refuses an ambiguous integration: the source merged twice on main's first-parent line", () => {
+      const again = githubMerge(c.merge1, c.commit);
+      expect(integration(c.commit, again).problems).toEqual([`the release source ${c.commit} is merged by 2 commits on ${MAIN}'s first-parent line (${again}, ${c.merge1}): the integration is ambiguous`]);
+    });
+
+    it("refuses an integrated source whose signature is missing, a stranger's, or by a key its own key file substitutes", () => {
+      const ref = "refs/remotes/test/main";
+      const integrated = (commit: string) => { setMain(githubMerge(c.merge2, commit), ref); return src(commit, { version: ROTATED, mainRef: ref }); };
+      try {
+        expect(integrated(x.unmerged).problems).toEqual([]);
+        expect(integrated(x.unsigned).problems).toEqual([`commit ${x.unsigned} is not signed by the owner's pinned commit key ${keys.commit} (signature N by no key)`]);
+        const stranger = integrated(x.strangerSigned).problems;
+        expect(stranger).toHaveLength(1);
+        expect(stranger[0]).toMatch(new RegExp(`^commit ${x.strangerSigned} is not signed by the owner's pinned commit key ${keys.commit} \\(signature [^G] by `));
+        // The stranger's key file, signed by the stranger: a signature that verifies against the commit's own key file,
+        // so only the pin catches it.
+        expect(integrated(x.foreignKey).problems).toEqual([`.github/ci/commit-signing-key.asc at ${x.foreignKey} does not hold the pinned commit-signing key ${keys.commit} (it holds ${keys.stranger})`]);
+        expect(src(c.commit, { commitPin: keys.stranger }).problems).toEqual([`.github/ci/commit-signing-key.asc at ${c.commit} does not hold the pinned commit-signing key ${keys.stranger} (it holds ${keys.commit})`]);
+        expect(src(c.commit, { commitPin: "" }).problems).toEqual(["no commit-signing key is pinned (40 upper-case hex digits)"]);
+      } finally {
+        setMain(null, ref);
+      }
+    });
+
+    it("fails closed on missing integration evidence: no fetched main, a shallow clone, replacement refs", () => {
+      expect(withMain(null, () => lib.integrationOf({ repo, commit: c.commit })).problems).toEqual([`${MAIN} is not in ${repo}: fetch origin first (the integration is checked against the fetched main)`]);
+      const { pkg, digest } = prepared();
+      expect(withMain(null, () => runVerify("package", pkg, digest)).out).toContain(`${MAIN} is not in ${repo}: fetch origin first`);
+      const shallow = join(base, `shallow-${++n}`);
+      git(base, ["clone", "-q", "--depth", "1", pathToFileURL(repo).href, shallow]);
+      expect(lib.integrationOf({ repo: shallow, commit: git(shallow, ["rev-parse", "HEAD"]).stdout.trim() }).problems).toEqual([`${shallow} is a shallow clone: main's history cannot be followed`]);
+      // A replacement ref that makes a non-merge main look like the integrating merge is never followed.
+      const plain = rawCommit(treeOf(c.main0), [c.main0], "Fixture <fixture@example.invalid>", "not a merge");
+      git(repo, ["replace", plain, c.merge1]);
+      try {
+        expect(integration(c.commit, plain).problems).toEqual([`the release source ${c.commit} is not reachable from ${MAIN} (${plain}): it is not integrated into main, or the clone's main is stale (fetch origin)`]);
+      } finally {
+        git(repo, ["replace", "-d", plain]);
+      }
+    });
+
+    it("never counts a record once the fetched main no longer integrates the source; main moving on keeps it", () => {
+      const { pkg, digest } = prepared();
+      expect(runVerify("package", pkg, digest).code).toBe(0);
+      signManifest(pkg);
+      expect(runVerify("signature", pkg, digest).code).toBe(0);
+      expect(report(pkg, digest)).toContain("VERIFIED THROUGH signature only");
+      // Main moves on through a later GitHub merge: the integrating merge is the same, so the records still count.
+      expect(withMain(githubMerge(c.merge2, x.unmerged), () => report(pkg, digest))).toContain("VERIFIED THROUGH signature only");
+      // A fetched main from before the merge (stale evidence): every record is stale, and the check now fails.
+      const md = withMain(c.main0, () => report(pkg, digest));
+      expect(row(md, "package")).toContain("stale: integration changed since");
+      expect(row(md, "signature")).toContain("stale: integration changed since");
+      expect(md).toContain("NOT VERIFIED: the package itself has no current PASS");
+      expect(withMain(c.main0, () => runVerify("package", pkg, digest)).out).toContain(`the release source ${c.commit} is not reachable from ${MAIN} (${c.main0})`);
+      expect(report(pkg, digest)).toContain("NOT VERIFIED"); // the FAIL replaced the PASS, also with main restored
+    });
+
+    it("stages a test build before integration, marked so, and never accepts it as a release candidate", () => {
+      // Staging: a would-be candidate needs the integration; a test build or a dry run does not, and is never a candidate.
+      expect(gate(x.unmerged, { testBuild: true })).toEqual({ required: false, problems: [], integration: null, why: "a test build (--test-version), never a release candidate" });
+      expect(gate(x.unmerged, { dirty: true })).toMatchObject({ required: false, problems: [] });
+      expect(gate(x.unmerged, { signature: "unverified" })).toMatchObject({ required: false, problems: [] });
+      expect(gate(x.unmerged)).toMatchObject({ required: true, problems: [`the release source ${x.unmerged} is not reachable from ${MAIN} (${c.merge2}): it is not integrated into main, or the clone's main is stale (fetch origin)`] });
+      expect(gate(c.commit, { version: VERSION })).toMatchObject({ required: true, problems: [], integration: { merge: c.merge1 } });
+      const id = manifestLib.buildId({ artifact: "npm-tarball", version: "1.0.2-vm.1", commit: x.unmerged, signature: "verified", dirty: false, testBuild: true, toolchain: { dotnetSdk: "10.0.403", node: "v24.11.0", npm: "11.6.1" }, builtAt: "2026-11-03T12:00:00.000Z" });
+      expect(id).toMatchObject({ testBuild: true, releaseCandidate: false });
+      // The test build is prepared and rehearsed without the integration, marked as a rehearsal throughout ...
+      const version = "1.0.2-rehearsal.1";
+      const dir = join(base, `case-${++n}`);
+      const digest = stage(join(dir, "staged"), { version, commit: x.unmerged, testBuild: true });
+      const p = runPrepare(join(dir, "staged"), join(dir, "pkg"), digest, { version, commit: x.unmerged, rehearsal: true, pins: P2() });
+      expect(p.code, p.out).toBe(0);
+      expect(p.out).toContain("a rehearsal: no integration into main required");
+      const pkg = join(dir, "pkg");
+      const r = runVerify("package", pkg, digest, { version, commit: x.unmerged, rehearsal: true, pins: P2() });
+      expect(r.code, r.out).toBe(0);
+      expect(r.out).toContain("PASS (REHEARSAL)");
+      expect(r.out).toContain("integration into main: not required (rehearsal: never a release)");
+      expect(report(pkg, digest, { version, commit: x.unmerged, rehearsal: true, pins: P2() })).toContain("| Integrated into main by | not required (rehearsal: never a release) |");
+      // ... and never verifies as a release: it is no candidate, and its source is not integrated.
+      const real = runVerify("package", pkg, digest, { version, commit: x.unmerged, pins: P2() });
+      expect(real.code).toBe(1);
+      expect(real.out).toContain("the manifest is not a release candidate");
+      expect(real.out).toContain(`the release source ${x.unmerged} is not reachable from ${MAIN}`);
+    });
+  });
+
   describe("signing keys over time", () => {
     it("rotation: a new release needs the current subkey; an earlier release still verifies under the rotated pins", () => {
       const old = prepared();
@@ -741,5 +948,47 @@ describe("Step 4: the release tooling has no signing or publication side effects
     expect(doc).toContain("$gpg = 'C:\\Program Files\\GnuPG\\bin\\gpg.exe'");
     expect(doc).toMatch(/server-reported values, not an independent download-and-hash check/);
     expect(doc).toContain("eleven-file procedure");
+  });
+
+  it("D-107 C-1: the owner verifies the accepted source commit and its integration, never main's head", () => {
+    const doc = readFileSync(join(root, "docs", "releasing.md"), "utf8");
+    expect(doc).not.toContain("checkout --detach origin/main");
+    expect(doc).not.toContain("verify-commit HEAD");
+    const sign = doc.slice(doc.indexOf("### 4. Sign (owner)"), doc.indexOf("### 5. Publish"));
+    const at = (s: string) => {
+      const i = sign.indexOf(s);
+      expect(i, s).toBeGreaterThan(-1);
+      return i;
+    };
+    // The typed values, the fetch, the owner's own GnuPG check of the commit, its checkout, then the verifier from it.
+    const order = ["Read-Host 'Source commit", "fetch origin", "verify-commit --raw $commit", "checkout --detach $commit", "merge-base --is-ancestor $commit origin/main", 'verify-release.mjs" package'];
+    for (let i = 1; i < order.length; i++) expect(at(order[i - 1]!), `${order[i - 1]} before ${order[i]}`).toBeLessThan(at(order[i]!));
+  });
+
+  it("TD C-1 correction: every step of the owner's source check stops on failure, before any code from the clone runs", () => {
+    const doc = readFileSync(join(root, "docs", "releasing.md"), "utf8");
+    const sign = doc.slice(doc.indexOf("### 4. Sign (owner)"), doc.indexOf("### 5. Publish"));
+    const block = sign.slice(sign.indexOf("```powershell"), sign.indexOf("```", sign.indexOf("```powershell") + 3));
+    const line = (s: string) => block.split("\n").find((l) => l.includes(s)) ?? "";
+    // Each git step and the verifier carry their own stop on the same line.
+    for (const step of ["fetch origin", "checkout --detach $commit", "merge-base --is-ancestor", 'verify-release.mjs" package']) expect(line(step), step).toMatch(/; if \(\$LASTEXITCODE -ne 0\) \{ throw 'STOP: [^']+' \}$/);
+    expect(line("-cnotmatch '^[0-9a-f]{40}$'")).toContain("throw 'STOP:");
+    // The signature: the owner's own Git and Gpg4win, one GOODSIG, one VALIDSIG whose primary is the pinned commit key.
+    expect(block).toContain('verify-commit --raw $commit 2>&1');
+    expect(block).toContain("'^\\[GNUPG:\\] GOODSIG '");
+    expect(block).toContain("$valid.Count -ne 1 -or $valid[0] -cnotmatch ' 261E3060E70B4904615F17BD026A2C3E92B42B25$'");
+    expect(block).toContain("throw 'STOP: the source commit is not signed by the commit key 261E3060E70B4904615F17BD026A2C3E92B42B25'");
+    expect(block).toMatch(/\(git -C \$clone rev-parse HEAD\) -cne \$commit -or \(git -C \$clone status --porcelain --untracked-files=all\)\) \{ throw 'STOP: /);
+    // The verifier, code from the clone, comes last.
+    expect(block.indexOf("verify-release.mjs")).toBeGreaterThan(block.indexOf("rev-parse HEAD"));
+    expect(block.match(/\$clone\\scripts/g)).toHaveLength(1);
+  });
+
+  it("D-107 C-1: staging checks the source's integration before it builds anything, and refuses on any problem", () => {
+    const s = code("scripts/package/stage-release.mjs");
+    const gate = s.indexOf("stagingSourceGate(");
+    expect(gate).toBeGreaterThan(-1);
+    for (const later of ["nodeVersion(o.nodeWin", "mkdtempSync(", "runOk("]) expect(s.indexOf(later), later).toBeGreaterThan(gate);
+    expect(s).toMatch(/if \(gate\.problems\.length\) \{\s*process\.stderr\.write\(``\);\s*return 1;\s*\}/);
   });
 });

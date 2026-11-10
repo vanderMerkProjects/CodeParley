@@ -321,11 +321,11 @@ function printCustodianEnd(r: CustodianEndResult, runId: string, io: CliIo, repo
       break;
     case "refused":
       io.out(`  custodian: the run is NOT ended: refused ${r.code}: ${printable(r.detail)}`);
-      io.out(r.code === "RUN_BUSY" ? `  A confirmed fix can still be applied. Stop what is running: code-parley runs stop ${runId} --abort${named}` : r.code === "RUN_NOT_OPEN" ? `  ${repo === undefined ? "The repository comes from the local run record, which proves nothing." : "The custodian holds no run under this id and repository: check both."} A protected run may still be open under another repository.` : "  A confirmed fix can still be applied.");
+      io.out(r.code === "RUN_BUSY" ? `  A confirmed fix can still be applied. The operator can withdraw it first: code-parley fix withdraw <run-id> <proposal> --repo <path>. Stop what is running: code-parley runs stop ${runId} --abort${named}` : r.code === "RUN_NOT_OPEN" ? `  ${repo === undefined ? "The repository comes from the local run record, which proves nothing." : "The custodian holds no run under this id and repository: check both."} A protected run may still be open under another repository.` : "  A confirmed fix can still be applied. The operator can withdraw it first: code-parley fix withdraw <run-id> <proposal> --repo <path>.");
       break;
     case "not_delivered":
       io.out(`  custodian: the run is NOT ended: the request did not reach it (${r.code}: ${printable(r.detail)})`);
-      io.out("  A confirmed fix can still be applied. Repeat this command once the custodian answers.");
+      io.out("  A confirmed fix can still be applied. The operator can withdraw it first: code-parley fix withdraw <run-id> <proposal> --repo <path>. Repeat this command once the custodian answers.");
       break;
     case "unknown":
       io.out(`  custodian: UNKNOWN whether the run ended: the answer was lost (${r.code}: ${printable(r.detail)})`);

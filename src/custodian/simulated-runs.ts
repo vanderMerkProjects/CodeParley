@@ -2101,6 +2101,7 @@ export function prepareFixDecision(store: SimRunStore, id: { canonicalPath: stri
   if (!run) throw refuse("RUN_NOT_OPEN", "the custodian holds no record of this run");
   const op = fixOperationOf(run, operationId);
   requirePendingProposal(run, op, nowMs);
+  requireLogRoom(run, null, "a decision"); // F-W3
   if (!read || read.problem !== null || !read.rendering) throw refuse("EVIDENCE_NOT_HELD", `the custodian cannot render delegated fix ${operationId}, so nothing can be confirmed: ${read?.problem ?? "it was not read"}`);
   const p = proposalOf(op)!;
   const baseline = op.begin["custodianBaseline"] as Record<string, unknown>;
@@ -2241,6 +2242,10 @@ export function listingEntry(f: SimListedFix, located: { id: { key: string; cano
       paths: changed.slice(0, MAX_LISTED_PATHS).map(escape), pathCount: changed.length,
       proposedAt: p["createdAt"] ?? null, expiresAt,
       confirmationExpiresAt: state === "waiting" ? (c?.["expiresAt"] ?? null) : null,
+      // POST-1 Fix Withdraw: a confirmed fix of an open run can be withdrawn; the guided withdrawal names these values back.
+      withdrawable: f.op.status === "confirmed" && !isRunTerminal(f.run) && c?.["decision"] === "confirm",
+      confirmationId: f.op.status === "confirmed" ? (c?.["confirmationId"] ?? null) : null,
+      confirmedRenderingDigest: f.op.status === "confirmed" ? (c?.["renderingDigest"] ?? null) : null,
     },
   };
 }
@@ -2260,6 +2265,7 @@ export function requireFreshFixDecision(store: SimRunStore, args: Record<string,
     throw refuse("CONFIRMATION_CONTENT_MISMATCH", "the proposal, its boundary, its baseline or the custodian's rendering changed since it was prepared; nothing was committed — show and decide again");
   }
   requirePendingProposal(run!, fixOperationOf(run!, String(args["operationId"])), nowMs);
+  requireLogRoom(run!, null, "a decision"); // F-W3
 }
 
 /** ApplyFixDecision: record the owner's decision on the fix operation (and an operator event on the run). */
@@ -2282,16 +2288,197 @@ export function applyFixDecision(store: SimRunStore, args: Record<string, unknow
     recordedAt: iso(nowMs), expiresAt, recordedBy: structuredClone(recordedBy), consumedAt: null, consumedBy: null,
   };
   const status = decision === "confirm" ? FIX_CONFIRMED : FIX_DECLINED;
-  if (decision === "reject") {
-    Object.assign(p, { retiredAt: iso(nowMs), retiredReason: FIX_DECLINED });
-    delete store.fixProposals?.[proposalKey(repoKey, runId, operationId)];
-  }
+  if (decision === "reject") Object.assign(p, { retiredAt: iso(nowMs), retiredReason: FIX_DECLINED });
   const next: SimRun = { ...run, operations: replaceOp(run, { ...op, status, outcome }) };
   const result = { operationId, decision, operationStatus: status, confirmationId, renderingDigest: args["renderingDigest"] ?? null, proposalDigest: args["proposalDigest"] ?? null, expiresAt, assurance: "local_admin_elevation" };
   const revision = run.runRevision + 1;
   const stored = { runId, kind: FIX_DECISION_ACTION, runRevision: revision, status: next.status, ...structuredClone(result) };
   const evidence: SimRunEvent = { seq: run.events.length + 1, kind: FIX_DECISION_ACTION, requestId, caller: "operator", clientPid: null, requestDigest: sha256OfCanonicalJson(stored), fromStatus: run.status, toStatus: next.status, at: iso(nowMs), result: structuredClone(stored) };
-  store.runs[key] = { ...next, runRevision: revision, events: [...run.events, evidence] };
+  const written: SimRun = { ...next, runRevision: revision, events: [...run.events, evidence] };
+  requireLogRoom(run, written, "a decision"); // F-W3: the event count and the size cap, as every run transition
+  store.runs[key] = written;
+  if (decision === "reject") delete store.fixProposals?.[proposalKey(repoKey, runId, operationId)]; // only once recorded
+  return stored;
+}
+
+// ---- POST-1 Fix Withdraw (GrantLedger.FixWithdraw.cs; contract revision 2) ----
+
+export const FIX_WITHDRAWAL_ACTION = "fix_withdrawal";
+export const FIX_WITHDRAWN = "withdrawn";
+export const FIX_WITHDRAWAL_FACTS_SCHEMA = "codeparley.custodian-fix-withdrawal-prepared.v1";
+
+/** RequireLogRoom: room for one more record in the run's log, and the written record within the size cap. */
+export function requireLogRoom(run: SimRun, next: SimRun | null, what: string): void {
+  const recovery = "end the run instead (`code-parley runs stop <run> --close --repo <path>`, accepted with a full log): that retires every proposal of the run, a confirmed fix included, so it can never be applied; it also ends the run's other work";
+  if (run.events.length >= SIM_RUN_LIMITS.maxRunEvents) {
+    throw refuse("BUDGET_EXHAUSTED", `the run's log is full (${SIM_RUN_LIMITS.maxRunEvents} records), so the custodian cannot record ${what}; nothing was recorded. Recovery: ${recovery}`);
+  }
+  if (next !== null && Buffer.byteLength(JSON.stringify(implementerRunProjection(next, null)), "utf8") > SIM_RUN_LIMITS.maxImplementerProjectionBytes) {
+    throw refuse("BUDGET_EXHAUSTED", `the run's record is at its size cap, so the custodian cannot record ${what}; nothing was recorded. Recovery: ${recovery}`);
+  }
+}
+
+/** A guided withdrawal's expected values (WithdrawalSelection). */
+export interface SimWithdrawalSelection {
+  repoKey: string;
+  confirmationId: string;
+  proposalDigest: string;
+  renderingDigest: string;
+}
+
+const WITHDRAWAL_SELECTION_KEYS = ["expectedRepoKey", "expectedConfirmationId", "expectedProposalDigest", "expectedRenderingDigest"] as const;
+
+/** CustodianCore.WithdrawalSelectionOf: all four or none; one to three, or a value of the wrong form, is MALFORMED_REQUEST. */
+export function withdrawalSelectionOf(args: Record<string, unknown>): SimWithdrawalSelection | null {
+  const present = WITHDRAWAL_SELECTION_KEYS.filter((k) => k in args).length;
+  if (present === 0) return null;
+  if (present !== WITHDRAWAL_SELECTION_KEYS.length) {
+    throw refuse("MALFORMED_REQUEST", "a guided withdrawal names all four expected values (expectedRepoKey, expectedConfirmationId, expectedProposalDigest, expectedRenderingDigest), or none");
+  }
+  const hex = (s: string) => /^[0-9a-f]{64}$/.test(s);
+  const key = (s: string) => s.length > 0 && s.length <= 256 && /^[\x21-\x7e]+$/.test(s);
+  const id = (s: string) => /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(s);
+  const value = (k: (typeof WITHDRAWAL_SELECTION_KEYS)[number], ok: (s: string) => boolean, what: string): string => {
+    const v = args[k];
+    if (typeof v !== "string" || !ok(v)) throw refuse("MALFORMED_REQUEST", `'${k}' must be ${what}`);
+    return v;
+  };
+  return {
+    repoKey: value("expectedRepoKey", key, "a repository identity of this custodian's scheme"),
+    confirmationId: value("expectedConfirmationId", id, "a confirmation id"),
+    proposalDigest: value("expectedProposalDigest", hex, "64 lowercase hex digits"),
+    renderingDigest: value("expectedRenderingDigest", hex, "64 lowercase hex digits"),
+  };
+}
+
+/** FixWithdrawalStateDigest: the "state shown" a withdrawal's commit re-derives. */
+export function fixWithdrawalStateDigest(run: SimRun | null, operationId: string): string {
+  const op = run?.operations.find((o) => o.operationId === operationId && o.kind === "fix") ?? null;
+  const p = op ? proposalOf(op) : null;
+  const c = (op?.outcome?.["confirmation"] ?? null) as Record<string, unknown> | null;
+  return sha256OfCanonicalJson({
+    schema: "codeparley.custodian-fix-withdrawal-state.v1",
+    runTerminal: run ? isRunTerminal(run) : null, status: op?.status ?? null,
+    confirmationId: c?.["confirmationId"] ?? null, consumedAt: c?.["consumedAt"] ?? null, expiresAt: c?.["expiresAt"] ?? null,
+    voidedAt: c?.["voidedAt"] ?? null, withdrawnAt: c?.["withdrawnAt"] ?? null,
+    proposalDigest: p?.["proposalDigest"] ?? null, retiredAt: p?.["retiredAt"] ?? null, renderingDigest: c?.["renderingDigest"] ?? null,
+  });
+}
+
+/** NotWithdrawable: why a fix cannot be withdrawn, by its state (null: it can). */
+function notWithdrawable(run: SimRun, op: SimRunOperation, sincePrepared: boolean): Error | null {
+  const c = (op.outcome?.["confirmation"] ?? null) as Record<string, unknown> | null;
+  const id = op.operationId;
+  const by = typeof c?.["consumedBy"] === "string" ? (c["consumedBy"] as string) : null;
+  const applyStatus = by === null ? null : run.operations.find((o) => o.operationId === by)?.status ?? null;
+  switch (op.status) {
+    case FIX_WITHDRAWN:
+      return refuse("CONFIRMATION_WITHDRAWN", sincePrepared
+        ? `delegated fix ${id} was withdrawn at ${String(c?.["withdrawnAt"])} by another withdrawal since this one was prepared; this commit recorded nothing`
+        : `delegated fix ${id} is already withdrawn (at ${String(c?.["withdrawnAt"])}, ${String((c?.["withdrawnBy"] as Record<string, unknown> | undefined)?.["assurance"])}); nothing changed`);
+    case FIX_CONSUMED:
+      return refuse("CONFIRMATION_CONSUMED",
+        `the confirmation of delegated fix ${id} already crossed the consumption boundary: application ${String(by)} began at ${String(c?.["consumedAt"])} (${applyStatus ?? "unknown"}); the withdrawal did nothing. `
+          + (applyStatus === "running"
+            ? "It may be writing now; neither a withdrawal nor ending the run undoes an application under way. Inspect it with `code-parley fix show`; an interrupted one is reconciled with `code-parley fix reconcile`"
+            : applyStatus === "applied"
+              ? "Its files stay as they are (a withdrawal never reverts files)"
+              : "It can never be applied again; an interrupted application is reconciled with `code-parley fix reconcile`"));
+    case FIX_DECLINED:
+      return refuse("FIX_DECLINED", `delegated fix ${id} was rejected by the owner; it can never be applied; nothing to withdraw`);
+    case FIX_CONFIRMED:
+      if (isRunTerminal(run)) return refuse("RUN_TERMINAL", `the run has ended (${run.status}); its fixes can no longer be applied; nothing to withdraw`);
+      if (!c || c["decision"] !== "confirm") return refuse("FIX_NOT_CONFIRMED", `delegated fix ${id} has no owner confirmation; nothing to withdraw`);
+      return null;
+    default:
+      return refuse("FIX_NOT_CONFIRMED", `delegated fix ${id} was never confirmed (${op.status}); nothing to withdraw. A pending proposal is rejected instead (\`code-parley fix review\` or \`fix reject\`)`);
+  }
+}
+
+/** WithdrawnRun: the run after the withdrawal, and the result recorded with it. */
+function withdrawnRun(run: SimRun, op: SimRunOperation, nowMs: number, requestId: string, recordedBy: Record<string, unknown>): { next: SimRun; stored: Record<string, unknown> } {
+  const outcome = structuredClone(op.outcome!);
+  const c = outcome["confirmation"] as Record<string, unknown>;
+  const p = outcome["proposal"] as Record<string, unknown>;
+  c["withdrawnAt"] = iso(nowMs);
+  c["withdrawnBy"] = structuredClone(recordedBy);
+  p["retiredAt"] ??= iso(nowMs);
+  p["retiredReason"] = FIX_WITHDRAWN;
+  const withOp: SimRun = { ...run, operations: replaceOp(run, { ...op, status: FIX_WITHDRAWN, outcome }) };
+  const revision = run.runRevision + 1;
+  const stored = {
+    runId: run.runId, kind: FIX_WITHDRAWAL_ACTION, runRevision: revision, status: withOp.status, operationId: op.operationId, operationStatus: FIX_WITHDRAWN,
+    confirmationId: c["confirmationId"] ?? null, renderingDigest: c["renderingDigest"] ?? null, proposalDigest: p["proposalDigest"] ?? null,
+    withdrawnAt: iso(nowMs), assurance: "local_admin_elevation",
+  };
+  const evidence: SimRunEvent = { seq: run.events.length + 1, kind: FIX_WITHDRAWAL_ACTION, requestId, caller: "operator", clientPid: null, requestDigest: sha256OfCanonicalJson(stored), fromStatus: run.status, toStatus: withOp.status, at: iso(nowMs), result: structuredClone(stored) };
+  return { next: { ...withOp, runRevision: revision, events: [...run.events, evidence] }, stored };
+}
+
+/** PrepareFixWithdrawal (the hold part): the intent's args, state digest, statement and facts. */
+export function prepareFixWithdrawal(store: SimRunStore, located: { key: string; canonicalPath: string | null }, runId: string, operationId: string, requestId: string, expected: SimWithdrawalSelection | null, nowMs: number): { args: Record<string, unknown>; stateDigest: string; rendering: string; facts: Record<string, unknown> } {
+  if (expected && located.canonicalPath !== null && located.key !== expected.repoKey) {
+    throw refuse("SELECTION_STALE", `the repository path now resolves to identity ${located.key}, not the identity that was selected (${expected.repoKey}); nothing was prepared — list again`);
+  }
+  const run = store.runs[runKey(located.key, runId)];
+  if (!run) throw refuse("RUN_NOT_OPEN", "the custodian holds no record of this run");
+  const op = fixOperationOf(run, operationId);
+  const why = notWithdrawable(run, op, false);
+  if (why) throw why;
+  const c = op.outcome!["confirmation"] as Record<string, unknown>;
+  const p = proposalOf(op)!;
+  const confirmationId = String(c["confirmationId"]);
+  const rendering = (c["renderingDigest"] ?? null) as string | null;
+  const proposalDigest = (p["proposalDigest"] ?? null) as string | null;
+  if (expected) {
+    if (confirmationId !== expected.confirmationId) throw refuse("SELECTION_STALE", `delegated fix ${operationId} now carries confirmation ${confirmationId}, not the one that was listed (${expected.confirmationId}); nothing was prepared — list again`);
+    if (proposalDigest !== expected.proposalDigest || rendering !== expected.renderingDigest) throw refuse("SELECTION_STALE", `delegated fix ${operationId}'s confirmed proposal or rendering is not the one that was listed; nothing was prepared — list again`);
+  }
+  requireLogRoom(run, withdrawnRun(run, op, nowMs, requestId, {}).next, "a withdrawal");
+  const changed = (Array.isArray(p["changes"]) ? (p["changes"] as Record<string, unknown>[]) : []).map((x) => String(x["path"] ?? ""));
+  const lapsed = c["voidedAt"] != null || Date.parse(String(c["expiresAt"])) <= nowMs || p["retiredAt"] != null;
+  const repo = located.canonicalPath === null ? `identity ${located.key}` : `${located.canonicalPath} (identity ${located.key})`;
+  const statement =
+    `Withdraw the confirmation of delegated fix ${operationId} of run ${runId}:\n`
+    + `  repository   ${repo}\n`
+    + `  confirmation ${confirmationId}, recorded ${String(c["recordedAt"])} (${String((c["recordedBy"] as Record<string, unknown> | undefined)?.["assurance"])}), expires ${String(c["expiresAt"])}\n`
+    + `  rendering    sha256 ${String(rendering)}\n`
+    + `  changes      ${changed.length} path(s): ${changed.slice(0, MAX_LISTED_PATHS).join(", ")}${changed.length > MAX_LISTED_PATHS ? ", …" : ""}\n`
+    + (lapsed ? "  It is already not applicable (expired or voided); the withdrawal makes that permanent.\n" : "")
+    + "\nThe withdrawal is permanent: this confirmation can never be applied, also after a restart, a new configuration or a resumed session.\n"
+    + "Nothing was applied by it, and no file is changed. The run, the repository's configuration and every other fix stay as they are.\n"
+    + "A fix applied earlier is not reverted.";
+  const args = { repositoryRoot: located.canonicalPath, repoKey: located.key, runId, operationId, confirmationId, proposalDigest, renderingDigest: rendering };
+  const facts = {
+    schema: FIX_WITHDRAWAL_FACTS_SCHEMA, repoKey: located.key, repositoryRoot: located.canonicalPath, runId, operationId, confirmationId, proposalDigest, renderingDigest: rendering,
+    confirmationExpiresAt: c["expiresAt"] ?? null, alreadyNotApplicable: lapsed,
+  };
+  return { args, stateDigest: fixWithdrawalStateDigest(run, operationId), rendering: statement, facts };
+}
+
+/** RequireFreshFixWithdrawal: the commit's freshness; a fix withdrawn, consumed or ended since the prepare refuses. */
+export function requireFreshFixWithdrawal(store: SimRunStore, args: Record<string, unknown>, recordedState: string): void {
+  const run = store.runs[runKey(String(args["repoKey"]), String(args["runId"]))];
+  if (!run) throw refuse("RUN_NOT_OPEN", "the custodian holds no record of this run");
+  const op = fixOperationOf(run, String(args["operationId"]));
+  if (fixWithdrawalStateDigest(run, op.operationId) === recordedState) return;
+  const why = notWithdrawable(run, op, true);
+  if (why) throw why;
+  throw refuse("SELECTION_STALE", `delegated fix ${op.operationId}'s confirmation changed since this withdrawal was prepared; this commit recorded nothing — prepare it again`);
+}
+
+/** ApplyFixWithdrawal: one record write (the enforcement); the content removed after it (`keepContent`: the removal fails). */
+export function applyFixWithdrawal(store: SimRunStore, args: Record<string, unknown>, requestId: string, recordedBy: Record<string, unknown>, nowMs: number, keepContent = false): Record<string, unknown> {
+  const key = runKey(String(args["repoKey"]), String(args["runId"]));
+  const run = store.runs[key]!;
+  const op = fixOperationOf(run, String(args["operationId"]));
+  if ((op.outcome?.["confirmation"] as Record<string, unknown> | undefined)?.["confirmationId"] !== args["confirmationId"]) {
+    throw refuse("SELECTION_STALE", "the fix carries another confirmation than the one this withdrawal was prepared for; this commit recorded nothing");
+  }
+  const { next, stored } = withdrawnRun(run, op, nowMs, requestId, recordedBy);
+  requireLogRoom(run, next, "a withdrawal");
+  store.runs[key] = next;
+  if (!keepContent) delete store.fixProposals?.[proposalKey(run.repoKey, run.runId, op.operationId)];
   return stored;
 }
 
@@ -2313,13 +2500,15 @@ function applyBegin(store: SimRunStore, run: SimRun, req: SimRunRequest, writer:
   const confirmation = (fix.outcome?.["confirmation"] ?? null) as Record<string, unknown> | null;
   if (fix.status === FIX_CONSUMED) throw refuse("CONFIRMATION_CONSUMED", `the confirmation of delegated fix ${fixOperationId} was already used by application ${String(confirmation?.["consumedBy"])}; a confirmation is single use`);
   if (fix.status === FIX_DECLINED) throw refuse("FIX_DECLINED", `the owner rejected delegated fix ${fixOperationId}; nothing is applied`);
+  // POST-1 Fix Withdraw: the status is checked first, before configuration, content or measurement.
+  if (fix.status === FIX_WITHDRAWN) throw refuse("CONFIRMATION_WITHDRAWN", `the owner withdrew the confirmation of delegated fix ${fixOperationId} at ${String(confirmation?.["withdrawnAt"])}; it can never be applied; nothing was applied`);
   if (fix.status !== FIX_CONFIRMED) throw refuse("FIX_NOT_CONFIRMED", `delegated fix ${fixOperationId} has no owner confirmation (${fix.status}); the owner confirms the custodian's rendering with \`code-parley fix confirm\``);
   const p = proposalOf(fix)!;
   if (!confirmation || confirmation["decision"] !== "confirm" || confirmation["repoKey"] !== run.repoKey || confirmation["runId"] !== run.runId) {
     throw refuse("FIX_NOT_CONFIRMED", `delegated fix ${fixOperationId} has no confirmation for this repository and run`);
   }
   if (Date.parse(String(confirmation["expiresAt"])) <= nowMs || p["retiredAt"] != null) {
-    throw refuse("CONFIRMATION_EXPIRED", `the confirmation of delegated fix ${fixOperationId} has expired; the owner confirms it again (\`code-parley fix confirm\`) while the proposal lives`);
+    throw refuse("CONFIRMATION_EXPIRED", `the confirmation of delegated fix ${fixOperationId} has expired; it can no longer be applied, and a confirmed fix is not confirmed again: delegate the fix again, or the owner withdraws it (\`code-parley fix withdraw <run> <proposal> --repo <path>\`)`);
   }
   const digest = String(p["proposalDigest"]);
   if (f["proposalDigest"] !== digest || confirmation["proposalDigest"] !== digest) throw refuse("EVIDENCE_NOT_HELD", `proposal ${String(f["proposalDigest"])} is not the confirmed proposal of delegated fix ${fixOperationId}`);

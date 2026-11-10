@@ -14,7 +14,11 @@ import { DomainError, isDomainError } from "../common/errors.js";
 import { sha256OfBytes, sha256OfCanonicalJson } from "../common/hash.js";
 import { CustodianGrants } from "../custodian/grants.js";
 import { protectedLoopGate, type CustodianTestHooks } from "../custodian/protected-loops.js";
-import { CUSTODIAN_UNAVAILABLE, type ConfigSection, type HeldAcceptance, type HeldRepositoryConfig, type RunSection } from "../custodian/protocol.js";
+import { CUSTODIAN_UNAVAILABLE, type ConfigSection, type HeldAcceptance, type HeldRepositoryConfig, type HeldSelftestConfirmation, type RunSection } from "../custodian/protocol.js";
+import type { SandboxBackend } from "../agents/codex/argv.js";
+import { acceptanceApplies, decideIsolation, type IsolationDecision } from "../agents/codex/isolation.js";
+import type { CodexProbe } from "../agents/codex/probe.js";
+import { loadSelfTest } from "../agents/codex/selftest.js";
 import { captureRulesConfigDigest } from "../custodian/config-digests.js";
 import type { CustodianPresence } from "../custodian/service-presence.js";
 import type { CaptureRulesInput } from "../capture/capture.js";
@@ -183,9 +187,56 @@ export function confirmedSelfTest(section: ConfigSection, rec: SelfTestRecord): 
   return section.selftestConfirmations.some((c) => c.usable && c.recordDigest === digest && c.selftestId === rec.selftest_id && c.codexVersion === rec.codex_version && c.backend === rec.backend && c.profileDigest === rec.profile_digest && c.mode === "S1");
 }
 
+/** Step 7.2: whether a custodian confirmation names this stored S1 record (the identity `confirmedSelfTest` checks),
+ * whatever its state — so a display can tell a revoked or lapsed confirmation of THIS record from one of another. */
+export function namesS1Record(c: HeldSelftestConfirmation, rec: SelfTestRecord): boolean {
+  return c.mode === "S1" && c.recordDigest === selfTestRecordDigest(rec) && c.selftestId === rec.selftest_id && c.codexVersion === rec.codex_version && c.backend === rec.backend && c.profileDigest === rec.profile_digest;
+}
+
+/** The stored FIX self-test a delegated fix rests on, as the delegation identifies it (`fix-operation.ts`). */
+export interface StoredFixIdentity {
+  selftestId: string;
+  codexSha256: string;
+  profileDigest: string;
+}
+
+/** The usable custodian FIX confirmation of this stored FIX self-test (same self-test, Codex binary and fixer profile),
+ * or undefined. The delegation's predicate, moved unchanged from `fix-operation.ts` (Step 7.2); pure. */
+export function confirmedFixSelfTest(section: ConfigSection, local: StoredFixIdentity): HeldSelftestConfirmation | undefined {
+  return section.selftestConfirmations.find((c) => c.mode === "FIX" && c.usable && c.selftestId === local.selftestId && c.codexSha256 === local.codexSha256 && c.profileDigest === local.profileDigest);
+}
+
+/** Step 7.2: whether a custodian confirmation names this stored FIX self-test, whatever its state (display only). */
+export function namesFixRecord(c: HeldSelftestConfirmation, local: StoredFixIdentity): boolean {
+  return c.mode === "FIX" && c.selftestId === local.selftestId && c.codexSha256 === local.codexSha256 && c.profileDigest === local.profileDigest;
+}
+
+/** The backends a protected review considers, in order: the configured Windows backend, else the compatibility row's
+ * preference. The review's rule, shared with `status` and `setup` (Step 7.2). */
+export function reviewBackends(platform: NodeJS.Platform, windowsSandbox: SandboxBackend | null | undefined, probe: CodexProbe): SandboxBackend[] {
+  return platform === "win32" && windowsSandbox ? [windowsSandbox] : [...probe.compat.preferredBackends];
+}
+
+/** The stored S1 self-test record a protected review loads for this backend (null: none stored for this exact Codex
+ * version, installation, backend and profile). */
+export function storedS1SelfTest(selftestDir: string, probe: CodexProbe, backend: SandboxBackend): Promise<SelfTestRecord | null> {
+  return loadSelfTest(selftestDir, probe.version, { mode: "S1", backend, installDir: probe.installDir, webSearchDisabledValue: probe.compat.webSearchDisabledValue, acceptanceId: null });
+}
+
+/** A protected review's isolation decision over the custodian's records: `selfTests` holds, per backend, the stored S1
+ * record the operator confirmed (null otherwise); acceptances of reduced isolation are the custodian's only. */
+export function protectedIsolationDecision(section: ConfigSection, probe: CodexProbe, backends: readonly SandboxBackend[], selfTests: ReadonlyMap<SandboxBackend, SelfTestRecord | null>): IsolationDecision {
+  return decideIsolation({ compat: probe.compat, codexVersion: probe.version, installDir: probe.installDir, backends, selfTests, acceptances: heldAcceptances(section), userHooksPresent: probe.userHooksPresent });
+}
+
 /** The held acceptances of reduced isolation in force, in the shape the isolation decision reads. */
 export function heldAcceptances(section: ConfigSection): IsolationAcceptance[] {
-  return section.acceptances.filter((a: HeldAcceptance) => a.usable).map((a) => ({
+  return section.acceptances.filter((a: HeldAcceptance) => a.usable).map(acceptanceShape);
+}
+
+/** A held acceptance in the shape the isolation decision reads (its usability is the caller's filter). */
+function acceptanceShape(a: HeldAcceptance): IsolationAcceptance {
+  return {
     acceptance_id: a.acceptanceId,
     accepted: a.accepted.filter((x): x is IsolationAcceptance["accepted"][number] => x === "unrestricted_reads" || x === "advisory_network"),
     backend: a.backend,
@@ -194,7 +245,16 @@ export function heldAcceptances(section: ConfigSection): IsolationAcceptance[] {
     accepted_at: a.recordedAt,
     via: "cli",
     revoked_at: null,
-  }));
+  };
+}
+
+/**
+ * Whether a held acceptance (usable or lapsed; never a revoked one) would apply to a protected review on one of
+ * `backends` with Codex `codexVersion`, by the decision's own rule (`acceptanceApplies`). Display only: `status` uses it
+ * so that only an acceptance the review could rest on decides whether the isolation row is lapsed.
+ */
+export function heldAcceptanceApplies(a: HeldAcceptance, backends: readonly SandboxBackend[], codexVersion: string): boolean {
+  return !a.revoked && backends.some((b) => acceptanceApplies(acceptanceShape(a), b, codexVersion));
 }
 
 /**

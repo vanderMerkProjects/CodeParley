@@ -1427,7 +1427,7 @@ exports[`tool surface (plan §11) > schemas have object roots and refuse unknown
       "openWorldHint": false,
       "readOnlyHint": false,
     },
-    "description_chars": 917,
+    "description_chars": 966,
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

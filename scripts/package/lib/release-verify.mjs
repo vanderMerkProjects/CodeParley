@@ -39,6 +39,18 @@ export function pinProblems(pins) {
   return p;
 }
 export const COMMIT_KEY_FILE = ".github/ci/commit-signing-key.asc";
+/**
+ * The owner's commit-signing key, pinned here by its primary fingerprint as well as committed in COMMIT_KEY_FILE
+ * (docs/releasing.md, "Keys"): a release source must be signed by exactly this key, whatever key file the source commit
+ * itself carries.
+ */
+export const COMMIT_KEY = Object.freeze({ primary: "261E3060E70B4904615F17BD026A2C3E92B42B25", file: COMMIT_KEY_FILE });
+/** Where a clone has main: the remote-tracking ref that `git fetch origin` updates (a clone's local branch does not move). */
+export const MAIN_REF = "refs/remotes/origin/main";
+/** The committer of a merge GitHub makes on the web (scripts/ci/verify-commit-identity.mjs): its name and e-mail address. */
+export const GITHUB_COMMITTER = Object.freeze({ name: "GitHub", email: "noreply@github.com" });
+const byGitHub = (c) => c.name === GITHUB_COMMITTER.name && c.email === GITHUB_COMMITTER.email;
+const who = (c) => `${c.name} (${c.email})`;
 /** The public repository the releases are published from: its numeric ID, which a rename does not change. */
 export const PUBLIC_REPO = Object.freeze({ name: "vanderMerkProjects/CodeParley", id: 1443307878 });
 
@@ -47,7 +59,7 @@ export const SIGNATURE = "release-manifest.json.asc";
 export const KEY_FILE = "codeparley-release-key.asc";
 export const REQUEST = "signing-request.json";
 export const REQUEST_SCHEMA = "codeparley.signing-request.v1";
-export const RECORD_SCHEMA = "codeparley.release-verification.v2";
+export const RECORD_SCHEMA = "codeparley.release-verification.v3";
 /** The verifier's steps, in order; each re-runs the ones before it. */
 export const STEPS = Object.freeze(["package", "signature", "tag", "payload", "remote"]);
 /** Files the workflow itself writes into a signing package; anything not listed, or not an artifact, is refused. */
@@ -361,23 +373,26 @@ export function verifyDetached({ gpg, keyArmored, pins, signatureFile, dataFile,
 // ---- git: the source commit and the release tag ---------------------------------------------------------------------
 
 export const git = (repo, args, opts = {}) => sh("git", ["-C", repo, ...args], opts);
+/** git on the object store as it is: replacement refs (refs/replace/) never stand in for a commit, tree or blob. */
+const objects = (repo, args, opts = {}) => git(repo, ["--no-replace-objects", ...args], opts);
 
 /** A file at a commit, from git's object store (not the working tree), with plumbing that applies no filter or
  *  textconv: the trusted copy of a pinned key. */
 export function fileAt(repo, commit, path) {
-  const r = git(repo, ["cat-file", "blob", `${commit}:${path}`]);
+  const r = objects(repo, ["cat-file", "blob", `${commit}:${path}`]);
   if (r.status !== 0) throw new Error(`${path} is not in commit ${commit} (${r.stderr.trim().split("\n")[0]})`);
   return r.stdout;
 }
 
 /**
  * The release source commit: it exists, its package.json carries the version (for a rehearsal's --test-version build,
- * the version before its pre-release suffix), and it is signed by the owner's COMMIT key (its own
- * .github/ci/commit-signing-key.asc), which shares no key with the release key.
+ * the version before its pre-release suffix), and it is signed by the owner's COMMIT key: the key pinned as `commitPin`
+ * (COMMIT_KEY), which its own .github/ci/commit-signing-key.asc must hold and which shares no key with the release key.
  */
-export function commitProblems({ repo, commit, version, gpg, pins, rehearsal = false }) {
+export function commitProblems({ repo, commit, version, gpg, pins, commitPin, rehearsal = false }) {
   const p = [];
-  if (git(repo, ["cat-file", "-e", `${commit}^{commit}`]).status !== 0) return [`commit ${commit} is not in ${repo}`];
+  if (!FPR.test(commitPin ?? "")) return ["no commit-signing key is pinned (40 upper-case hex digits)"];
+  if (objects(repo, ["cat-file", "-e", `${commit}^{commit}`]).status !== 0) return [`commit ${commit} is not in ${repo}`];
   try {
     const v = JSON.parse(fileAt(repo, commit, "package.json")).version;
     const want = rehearsal ? version.replace(/-.*$/, "") : version;
@@ -391,14 +406,93 @@ export function commitProblems({ repo, commit, version, gpg, pins, rehearsal = f
     const keys = listKeys(kr);
     const fprs = keys.flatMap((k) => [k.primary, ...k.subkeys.map((s) => s.fpr)]);
     if (fprs.includes(pins.primary) || approvedSubkeys(pins).some((s) => fprs.includes(s))) p.push("the commit-signing key file contains the release key: the two identities must stay separate");
-    const owner = keys[0]?.primary;
-    if (!owner) { p.push(`${COMMIT_KEY_FILE} at ${commit} holds no key`); return; }
-    if (sh(kr.gpg, [...kr.base, "--import-ownertrust"], { input: `${owner}:6:\n` }).status !== 0) p.push("the commit key cannot be trusted in the temporary keyring");
-    const r = git(repo, ["-c", `gpg.program=${gpg}`, "log", "-1", "--format=%G?%n%GF%n%GP", commit], { env: kr.env });
+    const owner = keys.find((k) => k.primary === commitPin);
+    if (!owner) { p.push(`${COMMIT_KEY_FILE} at ${commit} does not hold the pinned commit-signing key ${commitPin}${keys.length ? ` (it holds ${keys.map((k) => k.primary).join(", ")})` : ""}`); return; }
+    if (sh(kr.gpg, [...kr.base, "--import-ownertrust"], { input: `${commitPin}:6:\n` }).status !== 0) p.push("the commit key cannot be trusted in the temporary keyring");
+    const r = objects(repo, ["-c", `gpg.program=${gpg}`, "log", "-1", "--format=%G?%n%GF%n%GP", commit], { env: kr.env });
     const [status = "", signer = "", primary = ""] = r.stdout.trim().split("\n");
-    if (status !== "G" || !(fprs.includes(signer) || primary === owner)) p.push(`commit ${commit} is not signed by the owner's commit key (signature ${status || "?"} by ${signer || "no key"})`);
+    const byPinned = signer === commitPin || primary === commitPin || owner.subkeys.some((s) => s.fpr === signer);
+    if (status !== "G" || !byPinned) p.push(`commit ${commit} is not signed by the owner's pinned commit key ${commitPin} (signature ${status || "?"} by ${signer || "no key"})`);
   });
   return p;
+}
+
+/**
+ * C-1 ([[D-107]], workflow §9): how a source commit reached main, from Git objects alone (object ids, parents and trees;
+ * never a branch name, a label or a message). The release source is the owner-signed head of the merged pull request,
+ * never GitHub's merge commit. Established against `mainRef` (the clone's fetched main):
+ *  - the source is reachable from main;
+ *  - exactly one commit on main's first-parent line has the source among its merged parents: the integrating merge; it
+ *    has exactly two parents, the second being the source, and is committed by GitHub (a pull-request merge on the web);
+ *  - the source itself is not on that line (it reached main through the merge, not by a push or a fast-forward);
+ *  - the merge's tree is the source's tree: main received exactly the bytes that are released;
+ *  - main may have advanced since, but only through GitHub merges: every first-parent commit from main's tip down to the
+ *    integrating merge is one, so the merge stays verifiably on main's first-parent history.
+ * The committer is a classification, not a proof: GitHub's own signature on a merge is not verified (as in
+ * scripts/ci/verify-commit-identity.mjs). The source's own signature (commitProblems) and this object graph are what the
+ * release rests on. Missing, ambiguous or contradictory evidence is a problem; nothing is assumed.
+ * Returns { problems, main, merge, tree }: main's tip, the integrating merge (null unless every check passed) and the
+ * source's tree.
+ */
+export function integrationOf({ repo, commit, mainRef = MAIN_REF }) {
+  const out = { main: null, merge: null, tree: null };
+  const fail = (...problems) => ({ problems, ...out });
+  if (!COMMIT.test(commit ?? "")) return fail("the release source must be a full 40-character commit id");
+  if (objects(repo, ["cat-file", "-e", `${commit}^{commit}`]).status !== 0) return fail(`commit ${commit} is not in ${repo}`);
+  const shallow = objects(repo, ["rev-parse", "--is-shallow-repository"]).stdout.trim();
+  if (shallow !== "false") return fail(`${repo} is ${shallow === "true" ? "a shallow clone" : "not a readable repository"}: main's history cannot be followed`);
+  out.tree = objects(repo, ["rev-parse", "--verify", "--quiet", `${commit}^{tree}`]).stdout.trim() || null;
+  const main = objects(repo, ["rev-parse", "--verify", "--quiet", `${mainRef}^{commit}`]).stdout.trim();
+  if (!COMMIT.test(main)) return fail(`${mainRef} is not in ${repo}: fetch origin first (the integration is checked against the fetched main)`);
+  out.main = main;
+  const reachable = objects(repo, ["merge-base", "--is-ancestor", commit, main]).status;
+  if (reachable === 1) return fail(`the release source ${commit} is not reachable from ${mainRef} (${main}): it is not integrated into main, or the clone's main is stale (fetch origin)`);
+  if (reachable !== 0) return fail(`cannot tell whether ${commit} is reachable from ${mainRef} (${main})`);
+  const log = objects(repo, ["log", "--first-parent", "--no-show-signature", "--format=%H %T %P%x09%cn%x09%ce", main]);
+  if (log.status !== 0) return fail(`cannot read ${mainRef}'s first-parent history (${log.stderr.trim().split("\n")[0]})`);
+  const line = log.stdout.split("\n").filter(Boolean).map((l) => {
+    const [ids = "", name = "", email = ""] = l.split("\t");
+    const [id = "", tree = "", ...parents] = ids.split(" ");
+    return { id, tree, parents, committer: { name, email } };
+  });
+  if (line.length === 0 || line[0].id !== main) return fail(`cannot read ${mainRef}'s first-parent history`);
+  if (line.some((c) => c.id === commit)) return fail(`the release source ${commit} is on ${mainRef}'s first-parent line itself: it reached main without a merge (pushed or fast-forwarded), so no pull-request merge integrated it`);
+  const merging = line.flatMap((c, i) => (c.parents.slice(1).includes(commit) ? [{ ...c, i }] : []));
+  if (merging.length === 0) return fail(`no merge on ${mainRef}'s first-parent line merged the release source ${commit} itself: it is reachable from main only inside another merged commit (the merged pull request's head is a different commit)`);
+  if (merging.length > 1) return fail(`the release source ${commit} is merged by ${merging.length} commits on ${mainRef}'s first-parent line (${merging.map((c) => c.id).join(", ")}): the integration is ambiguous`);
+  const [m] = merging;
+  const problems = [];
+  if (m.parents.length !== 2 || m.parents[1] !== commit) problems.push(`${m.id} merges the release source, but not as the second of exactly two parents (parents ${m.parents.join(", ")})`);
+  if (!byGitHub(m.committer)) problems.push(`${m.id} merges the release source, but is committed by ${who(m.committer)}, not ${who(GITHUB_COMMITTER)}: not a pull-request merge made by GitHub`);
+  if (m.tree !== out.tree) problems.push(`the integrating merge ${m.id} has the tree ${m.tree}, not the release source's tree ${out.tree}: main did not receive exactly the source`);
+  const since = line.slice(0, m.i).find((c) => c.parents.length !== 2 || !byGitHub(c.committer));
+  if (since) problems.push(`main moved on after the integrating merge ${m.id} through ${since.id}, which is not a GitHub merge (${since.parents.length} parent(s), committer ${who(since.committer)}): main's history since the integration is not verifiable`);
+  return { problems, ...out, merge: problems.length ? null : m.id };
+}
+
+/**
+ * The release-source contract of a release candidate (verify-release.mjs package, prepare-signing.mjs and
+ * stage-release.mjs): commitProblems, and for anything but a rehearsal, integrationOf against the fetched main. A
+ * rehearsal is a --test-version build, never a release, so it is checked without the integration.
+ * Returns { problems, integration }: integration is integrationOf's result, or null for a rehearsal.
+ */
+export function releaseSourceProblems({ repo, commit, version, gpg, pins, commitPin, rehearsal = false, mainRef = MAIN_REF }) {
+  const problems = commitProblems({ repo, commit, version, gpg, pins, commitPin, rehearsal });
+  if (rehearsal) return { problems, integration: null };
+  const integration = integrationOf({ repo, commit, mainRef });
+  return { problems: [...problems, ...integration.problems], integration };
+}
+
+/**
+ * What staging requires of its source (stage-release.mjs). A build that would be a release candidate (a clean tree, a
+ * verified commit, not a --test-version build) is staged only from an integrated release source (releaseSourceProblems).
+ * A test build or a dry run is staged without the integration, and its BUILD-IDs and manifest say it is not a release
+ * candidate. Returns { required, problems, integration, why }.
+ */
+export function stagingSourceGate({ repo, commit, version, gpg, pins, commitPin, dirty, signature, testBuild, mainRef = MAIN_REF }) {
+  if (testBuild) return { required: false, problems: [], integration: null, why: "a test build (--test-version), never a release candidate" };
+  if (dirty || signature !== "verified") return { required: false, problems: [], integration: null, why: "a dry run (changes or an unverified commit), never a release candidate" };
+  return { required: true, why: "a release candidate", ...releaseSourceProblems({ repo, commit, version, gpg, pins, commitPin, mainRef }) };
 }
 
 /** A raw annotated tag object: { object, type, tag, tagger, message, payload, signature } or null. */
@@ -454,20 +548,23 @@ export function tagProblems({ repo, version, commit, manifestSha256, gpg, pins, 
 /**
  * What a step's PASS depends on, hashed now. A record keeps the state of its own scope; the report counts a PASS only
  * while the package still has that state.
- * - package: the manifest, every artifact and sidecar, and the signing request;
+ * - package: the manifest, every artifact and sidecar, the signing request, and the merge that integrated `commit` into
+ *   the clone's main (integrationOf; null when there is none): a main that no longer integrates it makes every record
+ *   stale, while main moving on through later merges does not;
  * - signature: + the detached signature; tag: + the local tag object; payload and remote: + the release key file and
  *   release-payload.json.
  */
-export function releaseState(dir, repo, version) {
+export function releaseState(dir, repo, version, commit) {
   const h = (f) => (existsSync(join(dir, f)) ? sha256(readFileSync(join(dir, f))) : null);
   let manifest = null;
   try { manifest = JSON.parse(readFileSync(join(dir, MANIFEST), "utf8")); } catch { /* no state without a manifest */ }
   const files = Array.isArray(manifest?.artifacts) ? manifest.artifacts.flatMap((a) => [a?.file, sidecarOf(String(a?.file))]).filter((f) => typeof f === "string" && SAFE_NAME.test(f)) : [];
   const content = manifest ? sha256(canonical({ manifest: h(MANIFEST), request: h(REQUEST), files: files.map((f) => [f, h(f)]) })) : null;
+  const integration = integrationOf({ repo, commit }).merge;
   const scope = {
-    package: { content },
-    signature: { content, signature: h(SIGNATURE) },
-    tag: { content, signature: h(SIGNATURE), tagObject: localTagObject(repo, version) },
+    package: { content, integration },
+    signature: { content, integration, signature: h(SIGNATURE) },
+    tag: { content, integration, signature: h(SIGNATURE), tagObject: localTagObject(repo, version) },
   };
   scope.payload = { ...scope.tag, key: h(KEY_FILE), payload: h("release-payload.json") };
   scope.remote = scope.payload;

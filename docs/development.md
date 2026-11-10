@@ -74,7 +74,9 @@ node plugin/build-plugin.mjs --out <dir> && node plugin/verify-plugin.mjs <dir>
 
 `scripts/package/stage-release.mjs` stages every release artifact and the unsigned manifest from a clean commit whose
 signature verifies against `.github/ci/commit-signing-key.asc`; `--allow-dirty` makes a dry run marked
-`releaseCandidate: false`. It signs and publishes nothing.
+`releaseCandidate: false`. A release candidate also needs the commit integrated into the fetched `origin/main` by its
+pull request's GitHub merge ([releasing.md](releasing.md), step 4); before that, `--test-version` stages a test build,
+which is never a candidate. It signs and publishes nothing.
 
 ## Test classes
 

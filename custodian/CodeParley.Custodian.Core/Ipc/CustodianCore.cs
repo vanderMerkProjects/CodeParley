@@ -92,7 +92,34 @@ internal sealed class CustodianCore
         // Step 7.1 (`fix review`): the operator's listing of the delegated fixes the custodian holds, across repositories (operator
         // only); an optional repository narrows it to that identity.
         ["list_fix_proposals"] = ["repositoryRoot"],
+        // POST-1 Fix Withdraw: the withdrawal of one confirmed, unconsumed fix (operator only; committed by `commit`). A
+        // guided selection names all four expected values, and may then omit the path (the listed identity locates it).
+        ["prepare_fix_withdrawal"] = ["repositoryRoot", "runId", "operationId", "expectedRepoKey", "expectedConfirmationId", "expectedProposalDigest", "expectedRenderingDigest"],
     };
+
+    private static readonly string[] WithdrawalSelectionKeys = ["expectedRepoKey", "expectedConfirmationId", "expectedProposalDigest", "expectedRenderingDigest"];
+
+    /// <summary>POST-1 Fix Withdraw: a guided withdrawal's expected values — all four or none. One to three, or a value of the
+    /// wrong form, is <c>MALFORMED_REQUEST</c>; a complete selection that no longer matches is the ledger's
+    /// <c>SELECTION_STALE</c>.</summary>
+    internal static GrantLedger.WithdrawalSelection? WithdrawalSelectionOf(JsonObject args)
+    {
+        int present = WithdrawalSelectionKeys.Count(args.ContainsKey);
+        if (present == 0) return null;
+        if (present != WithdrawalSelectionKeys.Length)
+            throw new CustodianRefusal(ErrorCodes.MalformedRequest, "a guided withdrawal names all four expected values (expectedRepoKey, expectedConfirmationId, expectedProposalDigest, expectedRenderingDigest), or none");
+        static bool Hex(string s) => s.Length == 64 && s.All(char.IsAsciiHexDigitLower);
+        static bool Key(string s) => s.Length is > 0 and <= 256 && RepoIdentities.IsCurrent(s) && s.All(c => c is > ' ' and < (char)127);
+        static bool Id(string s) => Guid.TryParseExact(s, "D", out _);
+        string Value(string key, Func<string, bool> ok, string what)
+            => args[key] is JsonValue v && v.TryGetValue(out string? s) && s is not null && ok(s) ? s
+               : throw new CustodianRefusal(ErrorCodes.MalformedRequest, $"'{key}' must be {what}");
+        return new GrantLedger.WithdrawalSelection(
+            Value("expectedRepoKey", Key, "a repository identity of this custodian's scheme"),
+            Value("expectedConfirmationId", Id, "a confirmation id"),
+            Value("expectedProposalDigest", Hex, "64 lowercase hex digits"),
+            Value("expectedRenderingDigest", Hex, "64 lowercase hex digits"));
+    }
 
     private static readonly string[] SelectionKeys = ["expectedRepoKey", "expectedProposalDigest", "expectedRenderingDigest"];
 
@@ -174,6 +201,8 @@ internal sealed class CustodianCore
                 "prepare_fix_decision" => Operator(caller, () => Prepared(_ledger.PrepareFixDecision(StrictStr(req, "repositoryRoot"), StrictStr(req, "runId"), StrictStr(req, "operationId"), StrictStr(req, "decision"), req.RequestId, ExpectedSelection(req)))),
                 // Step 7.1: operator only — an implementer or helper caller is refused before anything is read or listed.
                 "list_fix_proposals" => Operator(caller, () => _ledger.ListFixProposals(OptStr(req, "repositoryRoot"))),
+                // POST-1 Fix Withdraw: operator only — an implementer or helper caller is refused before anything is read.
+                "prepare_fix_withdrawal" => Operator(caller, () => Prepared(_ledger.PrepareFixWithdrawal(OptStr(req, "repositoryRoot"), StrictStr(req, "runId"), StrictStr(req, "operationId"), req.RequestId, WithdrawalSelectionOf(req.Args)))),
                 "render_fix_proposal" => caller is CallerClass.Operator or CallerClass.Implementer
                     ? Response.Success(_ledger.RenderFixProposal(StrictStr(req, "repositoryRoot"), StrictStr(req, "runId"), StrictStr(req, "operationId")))
                     : Response.Fail(ErrorCodes.CallerNotAuthorized, "not an authorized caller"),
@@ -270,7 +299,8 @@ internal sealed class CustodianCore
             ["expiresAt"] = p.ExpiresAt,
         };
         // Step 7.1: a fix decision's structured facts (versioned), so a client verifies what was prepared without parsing text.
-        if (p.Facts is not null) o["fixDecision"] = p.Facts.DeepClone();
+        // POST-1 Fix Withdraw: a withdrawal's facts, under their own name.
+        if (p.Facts is not null) o[p.Action == GrantLedger.FixWithdrawalAction ? "fixWithdrawal" : "fixDecision"] = p.Facts.DeepClone();
         return o;
     }
 

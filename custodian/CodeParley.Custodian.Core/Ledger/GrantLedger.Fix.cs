@@ -319,12 +319,21 @@ internal sealed partial class GrantLedger
     internal static void WriteOrphanProposalForTest(string repoKey, string runId, string operationId)
         => AtomicWrite(ProposalPath(repoKey, runId, operationId), "{\"schema\":\"" + FixProposalContentSchema + "\",\"orphan\":true}");
 
-    /// <summary>Remove the proposal files retired under the gate. Called only OUTSIDE the gate.</summary>
+    /// <summary>TEST only (the shared corpus, POST-1 Fix Withdraw W18): a deletion this returns true for fails as an I/O error.</summary>
+    internal static Func<string, bool>? DeleteFaultForTest { get; set; }
+
+    /// <summary>Remove the proposal files retired under the gate. Called only OUTSIDE the gate. A file that cannot be removed
+    /// stays (audited); it is retired in its record, so nothing offers or applies it, and the orphan sweep removes it later.</summary>
     private void DrainRetiredProposals()
     {
         while (_retiredProposals.TryDequeue(out string? file))
         {
-            try { File.Delete(file); Audit($"fix_proposal_removed op={Path.GetFileNameWithoutExtension(file)} (retired)"); }
+            try
+            {
+                if (DeleteFaultForTest?.Invoke(file) == true) throw new IOException("simulated deletion failure (test)");
+                File.Delete(file);
+                Audit($"fix_proposal_removed op={Path.GetFileNameWithoutExtension(file)} (retired)");
+            }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException) { Audit($"fix_proposal_remove_failed op={Path.GetFileNameWithoutExtension(file)}: {e.GetType().Name}"); }
         }
     }

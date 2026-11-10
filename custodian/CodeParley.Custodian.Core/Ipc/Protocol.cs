@@ -88,6 +88,8 @@ internal static class ErrorCodes
     // Step 7.1: a guided selection (complete and well-formed) that no longer matches the custodian's evidence — another
     // repository identity behind the path, another proposal, another rendering than the one reviewed.
     internal const string SelectionStale = "SELECTION_STALE";
+    // POST-1 Fix Withdraw: the operator withdrew the fix's confirmation; it can never be applied.
+    internal const string ConfirmationWithdrawn = "CONFIRMATION_WITHDRAWN";
     // Phase 5 F-i2-5: the custodian could not produce the reviewer-visible redaction of an amendment text.
     internal const string RedactionRefused = "REDACTION_REFUSED";
     internal const string Internal = "INTERNAL";

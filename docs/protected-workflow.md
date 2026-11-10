@@ -234,11 +234,18 @@ lists at most 50 fixes, those waiting for your decision first and the soonest to
 holds more, the listing says how many are not shown and how many of those wait for you. Decide some
 of the listed ones and list again, or list one repository with `--repo`.
 
+A fix you confirmed that the session has not applied yet is listed with a number too, offering
+`[w]ithdraw` or `[l]eave`. Withdrawing it shows the custodian's statement of what is withdrawn (the
+run, fix, confirmation and rendering digest) and asks you to type `withdraw`. The custodian then refuses
+every application of it, permanently. Nothing was applied by it, no file changes, and the run and every
+other fix stay as they are. An application that has already begun cannot be withdrawn.
+
 The same decision with the identifiers named:
 
 ```text
 fix confirm <run-id> <proposal> --repo <path>     you type "confirm"
 fix reject  <run-id> <proposal> --repo <path>     you type "reject"; the content is removed, nothing is applied
+fix withdraw <run-id> <proposal> --repo <path>    a CONFIRMED fix not yet applied: you type "withdraw"; it can never be applied
 ```
 
 These take the full run id and name the repository, and they read nothing from the implementer's
@@ -316,7 +323,8 @@ table is in [docs/troubleshooting.md](troubleshooting.md#refusal-codes).
 | `LOOP_START_UNRECONCILED` | A loop start's answer was lost | `code-parley loop stop <run>`, then a new run |
 | `RUN_BUSY` | One operation per run at a time | Wait, or cancel the active one |
 | `FIX_NOT_CONFIRMED`, `FIX_DECLINED` | No confirmation, or the operator rejected it | Nothing to apply |
-| `CONFIRMATION_EXPIRED` | The confirmation expired before it was applied | The operator confirms again |
+| `CONFIRMATION_EXPIRED` | The confirmation expired before it was applied | A new delegation (a confirmed fix is not confirmed again); the operator can withdraw the expired one |
+| `CONFIRMATION_WITHDRAWN` | The operator withdrew the confirmation | A new delegation, if the fix is still wanted |
 | `CONFIRMATION_CONSUMED` | It was already used | A new delegation |
 | `FIX_STALE` | The working tree moved since the fix's baseline | Nothing was written; delegate again from a new review |
 | `APPLY_IN_PROGRESS` | Another application is under way in this repository: one at a time | Wait for it; if it was interrupted, `code-parley fix reconcile <run>` |

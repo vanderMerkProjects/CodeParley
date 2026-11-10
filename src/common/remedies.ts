@@ -95,7 +95,7 @@ const CATALOG: Partial<Record<ErrorCode, Entry>> = {
   }),
   CONFIG_MISMATCH: (p) => ({
     cause: "what is installed no longer matches what the operator approved (the Codex installation or the engine runtime changed, for example after an update or an upgrade)",
-    fix: `approve the new one: the operator runs \`${operator(p).cli} setup --repo <path>\` ${operator(p).where}; after a Codex update the implementer first runs \`code-parley codex selftest\`${p === "linux" ? " and `config propose` / `config propose-selftest`" : ""}`,
+    fix: `approve the new one: the operator runs \`${operator(p).cli} setup --repo <path>\` ${operator(p).where} (a re-confirmation refused this way is not retried: setup sets the configuration again, with its own confirmation${p === "linux" ? ", from the implementer's `config propose` file" : ""}); after a Codex update the implementer first runs \`code-parley codex selftest\`${p === "linux" ? " and `config propose` / `config propose-selftest`" : ""}`,
   }),
   STALE_CONFIG: () => ({
     cause: "the configuration changed between the rendering you saw and its confirmation, so the confirmation covered something that is no longer current",
@@ -116,10 +116,10 @@ const CATALOG: Partial<Record<ErrorCode, Entry>> = {
     fix: `an administrator runs ${installer(p, "grant-repository", { path: true })}`,
   }),
   CODEX_ISOLATION_UNAVAILABLE: (p) => ({
-    cause: "Codex's sandbox could not be confirmed for this review (the stored self-test failed or is missing, or on Linux its basis changed or it lapsed with the boot)",
+    cause: "Codex's sandbox could not be confirmed for this review (the stored self-test failed or is missing, the operator's confirmation covers another stored self-test than the current one, or on Linux its basis changed or it lapsed with the boot)",
     fix: p === "linux"
-      ? "the implementer runs `code-parley codex selftest`, then `code-parley config propose-selftest --repo <path> --out <file>`; the operator confirms it with `/usr/local/sbin/code-parley-operator setup --resume --repo <path> --proposal-file <file>`"
-      : "the implementer runs `code-parley codex selftest` in an interactive desktop session; `code-parley doctor` shows the result",
+      ? "`code-parley status --repo <path>` (as the implementer) names which; the implementer runs `code-parley codex selftest` (for a delegated fix: `codex fix-selftest`) if the record is missing or failed, then `code-parley config propose-selftest --repo <path> --out <file>` (with `--fix` for a delegated fix); the operator confirms it with `/usr/local/sbin/code-parley-operator setup --resume --repo <path> --proposal-file <file>` (with `--fix` for a delegated fix)"
+      : "`code-parley status --repo <path>` names which; the implementer runs `code-parley codex selftest` (for a delegated fix: `codex fix-selftest`) in an interactive desktop session if the record is missing or failed, and the operator confirms the stored one with `code-parley setup --resume --repo <path> --home <the implementer's data home>` (with `--fix` for a delegated fix) in an elevated terminal",
   }),
   CODEX_INSTALLATION_UNSUPPORTED: () => ({
     cause: "the Codex installation named for protected reviews is not a form the custodian can measure (a launcher, a script or a link instead of the native executable)",
@@ -163,7 +163,12 @@ const CATALOG: Partial<Record<ErrorCode, Entry>> = {
   }),
   CONFIRMATION_EXPIRED: (p) => ({
     cause: "the operator's confirmation of a delegated fix expired before it was applied",
-    fix: `the operator confirms it again: \`${operator(p).cli} fix confirm <run> <proposal> --repo <path>\` ${operator(p).where}`,
+    // A confirmed fix is never confirmed again (the custodian decides only a proposed one): docs/troubleshooting.md.
+    fix: `delegate the fix again; the operator can withdraw the expired confirmation: \`${operator(p).cli} fix withdraw <run> <proposal> --repo <path>\` ${operator(p).where}`,
+  }),
+  CONFIRMATION_WITHDRAWN: () => ({
+    cause: "the operator withdrew the confirmation of this delegated fix; it can never be applied",
+    fix: "delegate the fix again if it is still wanted",
   }),
 };
 
@@ -177,12 +182,30 @@ function operatorEndpointDenied(code: string, message: string | undefined): bool
   return code === "CUSTODIAN_UNAVAILABLE" && message !== undefined && /operator/i.test(message) && /access (to the path )?is denied|EACCES|permission denied/i.test(message);
 }
 
+/** Review finding #3: a re-confirmation the custodian refused because the approved engine runtime's files changed in
+ * place (a repository re-confirmation's commit: STALE_CONFIG; the runtime's own re-confirmation: CONFIG_MISMATCH). Running
+ * the same command again, or `setup`, re-confirms it again and is refused the same way: the runtime is approved anew. */
+function runtimeChangedInPlace(code: string, message: string | undefined): boolean {
+  return (code === "STALE_CONFIG" || code === "CONFIG_MISMATCH") && message !== undefined && /the engine runtime (changed since this was prepared|measured now differs from the one approved)/.test(message);
+}
+
 /** The cause and fix for a refusal code on this platform, or null when the catalog has none. The error's message may
  * select a more precise remedy of the same code; it is never quoted. */
 export function remedyFor(code: string, platform: NodeJS.Platform = process.platform, message?: string): Remedy | null {
   if (operatorEndpointDenied(code, message)) {
     const r = CATALOG.CALLER_NOT_AUTHORIZED!(platformOf(platform));
     return { cause: "the custodian is running, but this account may not connect to its operator endpoint: operator commands are the operator's", fix: r.fix };
+  }
+  if (runtimeChangedInPlace(code, message)) {
+    const p = platformOf(platform);
+    const o = operator(p);
+    const approve = p === "linux"
+      ? `\`${o.cli} config approve-runtime --repo <path> --runtime /opt/codeparley/engine/<version> --runtime-git-path /usr/bin/git\``
+      : `\`${o.cli} config approve-runtime --repo <path> --runtime <the installed engine directory> --runtime-git-path <installed git.exe>\``;
+    return {
+      cause: "the files of the engine runtime the custodian approved changed in place since the approval, so it cannot be re-confirmed: running the same command again, or setup --resume, is refused the same way",
+      fix: `approve the runtime again as it is now: the operator runs ${approve} ${o.where}, then \`${o.cli} setup --resume --repo <path>\` for what remains`,
+    };
   }
   const e = (CATALOG as Record<string, Entry | undefined>)[code];
   return e ? e(platformOf(platform)) : null;

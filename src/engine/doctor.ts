@@ -23,7 +23,7 @@ import { readWorktreeLock } from "../store/locks.js";
 import { DATA_DIR_NAME, LEGACY_DATA_DIR_NAME, REPO_KEY_RE, runPaths } from "../store/paths.js";
 import { readTextIfExists } from "../store/atomic.js";
 import { gitExeOf, type Loaded } from "./engine-env.js";
-import { protectedStatus, type ProtectedStatus } from "./protected-status.js";
+import { protectedStatus, type FixEvidenceReader, type ProtectedStatus, type RecordState } from "./protected-status.js";
 
 /** Variables whose PRESENCE matters for hosts (C3, X13); values are never read out. */
 const ENV_NAMES =
@@ -245,6 +245,19 @@ export interface ProtectedDoctorFacts {
   /** Linux: the custodian's admitted filesystems and the Codex bubblewrap AppArmor profile file. */
   linux: { admitted_filesystems: number | null; apparmor_profile_file: boolean } | null;
   problems: string[];
+  /** Step 7.2: required records this account could not verify (not established; not a problem, not ready). */
+  not_verified: string[];
+}
+
+/** N-4: `doctor`'s exit code. A problem decides first (1); with none, a required record this account could not verify
+ * leaves the protected state not established (3, as `setup`); only then is everything OK (0). */
+export function doctorExitCode(problems: number, notVerified: number): 0 | 1 | 3 {
+  return problems > 0 ? 1 : notVerified > 0 ? 3 : 0;
+}
+
+/** The required records `protectedDoctor` files as not verified from this account. */
+export function notVerifiedRecords(status: ProtectedStatus): RecordState[] {
+  return (status.repository?.records ?? []).filter((r) => r.required && r.state === "unverified");
 }
 
 async function readersGrant(root: string): Promise<ProtectedDoctorFacts["readers_grant"]> {
@@ -270,11 +283,16 @@ async function readersGrant(root: string): Promise<ProtectedDoctorFacts["readers
   return { present: null, detail: "not checked on this platform" };
 }
 
-export async function protectedDoctor(le: Loaded, repositoryRoot: string | null): Promise<ProtectedDoctorFacts> {
-  const status = await protectedStatus(le, { repositoryRoot });
+export async function protectedDoctor(le: Loaded, repositoryRoot: string | null, fix?: FixEvidenceReader): Promise<ProtectedDoctorFacts> {
+  const status = await protectedStatus(le, { repositoryRoot, ...(fix ? { fix } : {}) });
   const problems: string[] = [];
+  const notVerified: string[] = [];
   if (status.state !== "ready") problems.push(`custodian: ${status.state.replace("_", " ")} — ${status.explanation[0] ?? ""}`);
-  for (const r of status.repository?.records ?? []) if (r.required && r.state !== "in_force") problems.push(`${r.record.replace("_", " ")}: ${r.state.replace("_", " ")} (${r.detail}) — ${r.restore ?? ""}`);
+  const unverified = new Set(notVerifiedRecords(status));
+  for (const r of status.repository?.records ?? []) {
+    if (!r.required || r.state === "in_force") continue;
+    (unverified.has(r) ? notVerified : problems).push(`${r.record.replace("_", " ")}: ${r.state.replace("_", " ")} (${r.detail}) — ${r.restore ?? ""}`);
+  }
   const readers = repositoryRoot && status.state !== "not_installed" && status.state !== "unsupported_platform" ? await readersGrant(repositoryRoot) : null;
   if (readers?.present === false) problems.push(`repository readers grant: missing — an administrator runs ${process.platform === "linux" ? "sudo bash codeparley-installer.sh grant-repository --path <repository>" : "codeparley-installer.ps1 grant-repository -Path <repository> (elevated)"}`);
   let linux: ProtectedDoctorFacts["linux"] = null;
@@ -295,5 +313,5 @@ export async function protectedDoctor(le: Loaded, repositoryRoot: string | null)
     linux = { admitted_filesystems: admitted, apparmor_profile_file: profile };
     if (admitted === 0) problems.push("no filesystem is admitted for the custodian (/etc/codeparley/filesystems.json): the installer's grant-repository admits the repository's");
   }
-  return { status, readers_grant: readers, linux, problems };
+  return { status, readers_grant: readers, linux, problems, not_verified: notVerified };
 }
