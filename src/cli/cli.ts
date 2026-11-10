@@ -59,9 +59,9 @@ import { runConfigCli, runConfigProposeCli } from "./config-commands.js";
 import { runFixCli } from "./fix-commands.js";
 import { runSetupCli } from "./setup-commands.js";
 import { doctor, doctorExitCode, notVerifiedRecords, protectedDoctor, type ProtectedDoctorFacts } from "../engine/doctor.js";
-import { RECORD_LABEL, renderStatus } from "./setup-commands.js";
+import { RECORD_LABEL, renderStatus, repositoryOf } from "./setup-commands.js";
 import { fixEvidenceReader } from "./status-fix-evidence.js";
-import { ensurePrivateDataHome, gitExeOf, loadEngine } from "../engine/engine-env.js";
+import { ensurePrivateDataHome, loadEngine } from "../engine/engine-env.js";
 import { selfOwner as ownerForDoctor } from "../store/owner.js";
 import { readRepoProposals } from "../checks/proposals.js";
 import { assertOperatorCodeTrusted, isOperatorCommand } from "./operator-trust.js";
@@ -593,7 +593,9 @@ async function doctorCmd(p: Parsed, io: CliIo): Promise<number> {
   // Phase 6 Increment 3: --protected adds the custodian's state, the repository's operator records and the host facts.
   if (has(p, "--repo") && !has(p, "--protected")) throw new DomainError("INVALID_ARGUMENT", "doctor --repo needs --protected");
   const repoRaw = one(p, "--repo");
-  const prot = has(p, "--protected") ? await protectedDoctor(le, repoRaw ? await resolveGitTopLevel(await canonicalizePath(repoRaw), { gitExe: await gitExeOf(le) }) : null, fixEvidenceReader(le)) : null;
+  // The repository as `status` and `setup` name it (repositoryOf): on Linux, an operator who cannot resolve it locally
+  // (an untraversable home, Git's ownership check) passes the plain path, and the custodian resolves its identity.
+  const prot = has(p, "--protected") ? await protectedDoctor(le, repoRaw ? await repositoryOf(le, repoRaw) : null, fixEvidenceReader(le)) : null;
   const { code, ok, headline } = doctorOutcome(r, prot);
   if (has(p, "--json")) {
     io.out(JSON.stringify(prot ? { ...r, ok, protected: prot } : r, null, 2));

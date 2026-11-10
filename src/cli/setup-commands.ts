@@ -65,8 +65,9 @@ export async function runSetupCli(a: SetupArgs, io: CliIo): Promise<number> {
   return setup(le, a, io);
 }
 
-/** The repository as this account can name it: its git top level, or on Linux (the operator cannot read it) the plain path. */
-async function repositoryOf(le: Loaded, raw: string): Promise<string> {
+/** The repository as this account can name it: its git top level, or on Linux (the operator cannot read it) the plain
+ *  path, which the custodian resolves itself (Phase 5 G-OP). Used by `status`, `setup` and `doctor --protected`. */
+export async function repositoryOf(le: Loaded, raw: string): Promise<string> {
   try {
     return await resolveGitTopLevel(await canonicalizePath(raw), { gitExe: await gitExeOf(le) });
   } catch (e) {
