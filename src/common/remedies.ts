@@ -163,7 +163,12 @@ const CATALOG: Partial<Record<ErrorCode, Entry>> = {
   }),
   CONFIRMATION_EXPIRED: (p) => ({
     cause: "the operator's confirmation of a delegated fix expired before it was applied",
-    fix: `the operator confirms it again: \`${operator(p).cli} fix confirm <run> <proposal> --repo <path>\` ${operator(p).where}`,
+    // A confirmed fix is never confirmed again (the custodian decides only a proposed one): docs/troubleshooting.md.
+    fix: `delegate the fix again; the operator can withdraw the expired confirmation: \`${operator(p).cli} fix withdraw <run> <proposal> --repo <path>\` ${operator(p).where}`,
+  }),
+  CONFIRMATION_WITHDRAWN: () => ({
+    cause: "the operator withdrew the confirmation of this delegated fix; it can never be applied",
+    fix: "delegate the fix again if it is still wanted",
   }),
 };
 
