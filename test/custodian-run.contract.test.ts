@@ -726,11 +726,13 @@ const custodianExe = ["Debug", "Release"]
   .find((p) => existsSync(p)) ?? null;
 
 describe.skipIf(process.platform !== "win32" || custodianExe === null)("the same corpus against the REAL custodian ledger (self-test-run-corpus, when built)", () => {
+  // Both tests below replay the full corpus through the real ledger, which has run past Vitest's global 60 s on
+  // hosted Windows runners; each gets 180 s while its spawnSync keeps its own 120 s limit.
   it("passes every scenario", () => {
     const r = spawnSync(custodianExe!, ["self-test-run-corpus", "--corpus", CORPUS_PATH], { encoding: "utf8", windowsHide: true, timeout: 120_000 });
     expect(r.stdout + r.stderr).toMatch(/run corpus self-test: all \d+ scenarios \(\d+ steps\) passed/);
     expect(r.status).toBe(0);
-  });
+  }, 180_000);
 
   // P3.4C-5 Increment 3 (N5-5): the custodian derives over a snapshot of what it holds; the real and the simulated
   // custodian build the SAME snapshot at every derive step of the corpus (ids, times and the scratch paths normalized).
@@ -754,7 +756,7 @@ describe.skipIf(process.platform !== "win32" || custodianExe === null)("the same
     } finally {
       rmSync(dump, { recursive: true, force: true });
     }
-  });
+  }, 180_000);
 });
 
 /** A snapshot with what legitimately differs between two custodians replaced: times, generated ids (by order of first
