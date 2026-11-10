@@ -3,7 +3,7 @@
 // storedFixSelfTest, on the delegation's own backend rule) — it launches nothing and confirms nothing. It lives in the
 // CLI so engine/protected-status.ts imports no fixer module (test/delegated-fix-layering.test.ts).
 
-import { access, constants } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import { isDomainError } from "../common/errors.js";
 import { fixBackendFor, storedFixSelfTest } from "../engine/fix-confirmation.js";
 import type { Loaded } from "../engine/engine-env.js";
@@ -17,8 +17,10 @@ export function fixEvidenceReader(le: Loaded): FixEvidenceReader {
     // Review finding #7: a Codex executable this account cannot read leaves the FIX record unidentifiable (its identity
     // binds the binary's SHA-256). That is an observation that could not be made, not a missing record: the caller
     // reports it as store_inaccessible. The delegation's own rule (storedFixSelfTest) is unchanged.
+    // N-3: an actual open for reading, not fs.access: on Windows access() checks only existence and the read-only
+    // attribute, so an executable its ACL makes unreadable passed it and was then reported as a missing record.
     try {
-      await access(probe.launcher.exe, constants.R_OK);
+      await (await open(probe.launcher.exe, "r")).close();
     } catch (e) {
       throw new Error(`the Codex executable ${probe.launcher.exe} cannot be read to identify it: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
     }

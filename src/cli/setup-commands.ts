@@ -79,7 +79,7 @@ async function repositoryOf(le: Loaded, raw: string): Promise<string> {
 // status
 // ---------------------------------------------------------------------------
 
-const RECORD_LABEL: Record<RecordState["record"], string> = {
+export const RECORD_LABEL: Record<RecordState["record"], string> = {
   engine_runtime: "engine runtime",
   repository: "repository configuration",
   isolation: "Codex isolation (S1)",

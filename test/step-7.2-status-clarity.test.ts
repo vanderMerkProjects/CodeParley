@@ -14,11 +14,11 @@
 // Evidence class: simulation (the native VMs run the real custodians).
 
 import { describe, it, expect } from "vitest";
-import { copyFile, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runCli } from "../src/cli/cli.js";
+import { doctorOutcome, runCli } from "../src/cli/cli.js";
 import { proposalConfirmed } from "../src/cli/setup-commands.js";
 import { remedyFor } from "../src/common/remedies.js";
 import { observeStoredSelfTests, repositoryRecords, repositoryStateOf, type FixEvidence, type Observed, type RecordState, type S1Evidence } from "../src/engine/protected-status.js";
@@ -42,6 +42,8 @@ import { fixProfileDigest } from "../src/agents/codex/fix-profile.js";
 import { fixProfileFor } from "../src/engine/fix-confirmation.js";
 import { storeLayout } from "../src/store/paths.js";
 import { sha } from "./helpers/delegated-fix.js";
+import { spawnSync } from "node:child_process";
+import { doctorExitCode, type ProtectedDoctorFacts } from "../src/engine/doctor.js";
 
 // ---------------------------------------------------------------------------
 // Unit: the rows against the evidence (T1–T10)
@@ -744,4 +746,183 @@ describe("Step 7.2 — layering: the status path imports no fixer module; no new
     const importers = (target: string) => [...reachable("cli/main.ts")].filter((rel) => [...readFileSync(join(srcDir, rel), "utf8").matchAll(/(?:from\s+|import\(\s*)["'](\.{1,2}\/[^"']+)\.js["']/g)].some((m) => srcRel(join(dirname(join(srcDir, rel)), m[1]! + ".ts")) === target)).sort();
     expect(importers("cli/status-fix-evidence.ts")).toEqual(users);
   });
+});
+
+// ---------------------------------------------------------------------------
+// POST-1 grouped operator-diagnostics correction (TD POST-1-DIAGNOSTICS-AND-STATIC-CORRECTION-AUTHORIZED): N-3, N-4, O-11
+// ---------------------------------------------------------------------------
+
+describe("POST-1 diagnostics — O-11: a lapsed S1 confirmation, a lapsed S2 acceptance and an unobserved lapse are told apart", () => {
+  // The two platform models: the review's backend there, and the operator CLI's resume command.
+  const models = [
+    { platform: "win32" as NodeJS.Platform, backend: "mxc" as SandboxBackend, resume: "code-parley setup --resume --repo C:\\r" },
+    { platform: "linux" as NodeJS.Platform, backend: "bwrap" as SandboxBackend, resume: "/usr/local/sbin/code-parley-operator setup --resume --repo C:\\r" },
+  ];
+  const linuxOperator: Observed<S1Evidence> = { ok: false, reason: "store_inaccessible", why: "by design", verify: "the implementer: code-parley status --repo /r" };
+
+  for (const m of models) {
+    const applicable = realAcceptance({ backend: m.backend });
+    const ev = (s: ConfigSection, stored: (SelfTestRecord | null)[]) => s1ev(s, stored, [m.backend]);
+
+    it(`${m.platform}: the stored record's own lapsed S1 confirmation keeps the S1 wording and restore`, async () => {
+      const r1 = rec({ backend: m.backend });
+      const s = section([conf(r1, { lapsed: true, usable: false, lapsedAtRecoveryId: "rec-1" })], [lapsedOf(applicable)]);
+      const r = await row(s, "isolation", { s1: ev(s, [r1]), platform: m.platform });
+      expect(r).toMatchObject({ state: "lapsed", required: true, resumable: true, detail: expect.stringMatching(/^the S1 self-test confirmation lapsed/) });
+      expect(r.detail).not.toMatch(/reduced-isolation|not established/);
+      if (m.platform === "linux") expect(r.restore).toMatch(/^the implementer: code-parley codex selftest, then code-parley config propose-selftest .*setup --resume --repo C:\\r --proposal-file <file>$/);
+      else expect(r.restore).toBe('code-parley setup --resume --repo C:\\r --home "C:\\impl"');
+    });
+
+    it(`${m.platform}: an applicable lapsed S2 acceptance is named, with its id and backend, and restored by setup --resume`, async () => {
+      const stored = rec({ selftest_id: "st-new", backend: m.backend });
+      const s = section([conf(rec({ selftest_id: "st-old", backend: m.backend }))], [lapsedOf(applicable)]);
+      const r = await row(s, "isolation", { s1: ev(s, [stored]), platform: m.platform });
+      expect(r).toMatchObject({ state: "lapsed", required: true, resumable: true, restore: m.resume });
+      expect(r.detail).toBe(`the reduced-isolation (S2) acceptance a-1 for ${m.backend} lapsed after a restart of the OS or a rollback (setup --resume re-confirms it with the repository's configuration)`);
+      expect(r.detail).not.toMatch(/S1 self-test confirmation|new self-test/);
+    });
+
+    it(`${m.platform}: an inapplicable lapsed acceptance decides nothing, and a revoked S1 confirmation beside a lapsed acceptance stays revoked`, async () => {
+      const stored = rec({ selftest_id: "st-new", backend: m.backend });
+      const other = section([conf(rec({ selftest_id: "st-old", backend: m.backend }))], [lapsedOf(realAcceptance({ backend: m.backend, codexVersionRange: "0.159" }))]);
+      expect(await row(other, "isolation", { s1: ev(other, [stored]), platform: m.platform })).toMatchObject({ state: "unconfirmed", reason: "record_changed" });
+      const r1 = rec({ backend: m.backend });
+      const revoked = section([conf(r1, { revoked: true, usable: false })], [lapsedOf(applicable)]);
+      expect(await row(revoked, "isolation", { s1: ev(revoked, [r1]), platform: m.platform })).toMatchObject({ state: "revoked", resumable: false });
+      expect(await row(revoked, "isolation", { s1: linuxOperator, platform: m.platform })).toMatchObject({ state: "revoked", resumable: false });
+    });
+
+    it(`${m.platform}: unobserved, a lapse says that the record or backend was not established`, async () => {
+      const notObserved: Observed<S1Evidence> = m.platform === "linux" ? linuxOperator : { ok: false, reason: "not_compared", why: "another account's data home", verify: "v" };
+      // Only an acceptance lapsed: named, with its restore; whether the review would rest on it is not established.
+      const onlyAcc = await row(section([], [lapsedOf(applicable)]), "isolation", { s1: notObserved, platform: m.platform });
+      expect(onlyAcc).toMatchObject({ state: "lapsed", resumable: true, restore: m.resume });
+      expect(onlyAcc.detail).toBe(`the reduced-isolation (S2) acceptance a-1 for ${m.backend} lapsed after a restart of the OS or a rollback (setup --resume re-confirms it with the repository's configuration); whether a protected review would rest on it was not established from this account (${notObserved.ok ? "" : notObserved.why})`);
+      // An S1 confirmation lapsed (with or without an acceptance): the S1 wording, which record not established.
+      for (const accs of [[], [lapsedOf(applicable)]]) {
+        const s1Lapse = await row(section([conf(rec({ backend: m.backend }), { lapsed: true, usable: false })], accs), "isolation", { s1: notObserved, platform: m.platform });
+        expect(s1Lapse).toMatchObject({ state: "lapsed", resumable: true });
+        expect(s1Lapse.detail).toMatch(/^the S1 self-test confirmation lapsed .*; which stored self-test a protected review would use was not established from this account \(/);
+      }
+      // No evidence at all: still not established, said so.
+      expect((await row(section([], [lapsedOf(applicable)]), "isolation", { platform: m.platform })).detail).toMatch(/was not established from this account \(the stored self-test was not compared\)$/);
+    });
+  }
+});
+
+describe("POST-1 diagnostics — N-4: doctor's exit code", () => {
+  it("problems decide first (1); with none, an unverified required record is 3; else 0", () => {
+    expect(doctorExitCode(0, 0)).toBe(0);
+    expect(doctorExitCode(1, 0)).toBe(1);
+    expect(doctorExitCode(2, 3)).toBe(1);
+    expect(doctorExitCode(0, 2)).toBe(3);
+  });
+});
+
+describe.skipIf(!supported)("POST-1 diagnostics — N-3 and N-4 on the simulated custodian", () => {
+  it("N-3: a Codex executable this account cannot read is store_inaccessible, not record_missing (Windows: an ACL denial; Linux: mode 000)", async () => {
+    const f = await contFixture(okScenario(output({ findings: [] })), { accounts: true });
+    await storeFixtureSelfTest(f);
+    expect((await cli(f, ["setup", "--repo", f.repo, ...(await setupArgs(f))], terminal())).code).toBe(0);
+    const held = await heldSection(f);
+    const withFix = { ...held, selftestConfirmations: [...held.selftestConfirmations, fixConf()] };
+    const probe = await probeCodex({ configured: f.codexExe, sourceEnv: process.env, testLauncher: { file: process.execPath, prefixArgs: [f.fakeScript] } });
+    // A controlled copy in the fixture's scratch directory: the installed Codex is never touched.
+    const copy = join(f.scratch, "unreadable-copy-codex.exe");
+    await copyFile(f.codexExe, copy);
+    const at = (p: CodexProbe): CodexProbe => ({ ...p, launcher: { ...p.launcher, exe: copy } });
+    const user = `${process.env["USERDOMAIN"] ?? ""}\\${process.env["USERNAME"] ?? ""}`;
+    if (process.platform === "win32") {
+      const icacls = join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "icacls.exe");
+      const deny = spawnSync(icacls, [copy, "/deny", `${user}:(RD)`], { encoding: "utf8", windowsHide: true });
+      expect(deny.status, deny.stdout + deny.stderr).toBe(0);
+      try {
+        await expect(readFile(copy)).rejects.toMatchObject({ code: expect.stringMatching(/^(EPERM|EACCES)$/) });
+        await expect(fixEvidenceReader(f.le)(at(probe))).rejects.toThrow(/cannot be read to identify it: (EPERM|EACCES)/);
+        const observed = await observeStoredSelfTests(f.le, { platform: "win32", root: f.repo, on: "implementer", section: held, fix: (p) => fixEvidenceReader(f.le)(at(p)) });
+        expect(observed.fix).toMatchObject({ ok: false, reason: "store_inaccessible", why: expect.stringContaining("cannot be read or identified") });
+        expect(await row(withFix, "fix_confirmation", { fix: observed.fix })).toMatchObject({ state: "unverified", reason: "store_inaccessible" });
+      } finally {
+        spawnSync(icacls, [copy, "/remove:d", user], { windowsHide: true });
+      }
+    } else if (process.getuid?.() !== 0) {
+      await chmod(copy, 0o000);
+      try {
+        await expect(fixEvidenceReader(f.le)(at(probe))).rejects.toThrow(/cannot be read to identify it: EACCES/);
+        const observed = await observeStoredSelfTests(f.le, { platform: "win32", root: f.repo, on: "implementer", section: held, fix: (p) => fixEvidenceReader(f.le)(at(p)) });
+        expect(observed.fix).toMatchObject({ ok: false, reason: "store_inaccessible" });
+      } finally {
+        await chmod(copy, 0o755);
+      }
+    }
+    // Readable again: the delegation's own refusal for want of a record, as before (a missing record).
+    expect(await fixEvidenceReader(f.le)(at(probe))).toMatchObject({ local: null, why: expect.stringContaining("no stored cp_fix self-test") });
+  }, 240_000);
+
+  it("N-4: doctor --protected exits 0 / 3 / 1 by precedence, its headline says NOT VERIFIED, and --json agrees; doctor alone is unchanged", async () => {
+    const f = await contFixture(okScenario(output({ findings: [] })), { accounts: true });
+    await storeFixtureSelfTest(f);
+    expect((await cli(f, ["setup", "--repo", f.repo, ...(await setupArgs(f))], terminal())).code).toBe(0);
+    const doctorArgs = ["doctor", "--protected", "--repo", f.repo];
+    const asImplementer = () => ({ ...operatorIo(""), engineTestHooks: f.le.env.testHooks! });
+    const linuxOperator = { ...f.operatorHooks!, custodian: { ...f.operatorHooks!.custodian!, platform: "linux" as NodeJS.Platform } };
+    const asLinuxOperator = () => ({ ...operatorIo(""), engineTestHooks: linuxOperator });
+
+    // The base doctor (no --protected) is unchanged: 0 exactly when it is ok, no protected part. In this fixture it has
+    // its own problems (the host's Node.js and Codex, no allowed roots), so the protected outcome is also checked below
+    // with a clean base, through the same function the CLI uses.
+    type Doc = { ok: boolean; problems: string[]; protected?: ProtectedDoctorFacts };
+    const plainJson = await cli(f, ["doctor", "--json"], asImplementer());
+    const base = JSON.parse(plainJson.out) as Doc;
+    expect(base.protected).toBeUndefined();
+    expect(plainJson.code).toBe(base.ok ? 0 : 1);
+    const plain = await cli(f, ["doctor"], asImplementer());
+    expect(plain.code).toBe(plainJson.code);
+    expect(plain.out.split("\n").at(-1)).toBe(base.ok ? "doctor: OK" : `doctor: ${base.problems.length} problem(s)`);
+    const clean = { ok: true, problems: [] as string[] };
+
+    /** doctor --protected as `io`: the CLI's code, JSON and headline agree with doctorOutcome; returns the facts. */
+    const run = async (io: () => ReturnType<typeof operatorIo>) => {
+      const j = await cli(f, [...doctorArgs, "--json"], io());
+      const doc = JSON.parse(j.out) as Doc;
+      const want = doctorOutcome(base, doc.protected!);
+      expect(j.code).toBe(want.code);
+      expect(doc.ok).toBe(want.ok);
+      const t = await cli(f, doctorArgs, io());
+      expect(t.code).toBe(want.code);
+      expect(t.out.split("\n").at(-1)).toBe(want.headline);
+      // The readers-grant line reads the fixture repository's real access list (a host fact, not under test here).
+      const prot = doc.protected!;
+      return { prot: { ...prot, problems: prot.problems.filter((x) => !x.startsWith("repository readers grant")) }, text: t.out };
+    };
+
+    // Everything verified (the implementer; the Windows operator with --home): no problem, nothing unverified → 0, OK.
+    for (const io of [asImplementer, () => operatorIo("")]) {
+      const { prot, text } = await run(io);
+      expect(prot.problems).toEqual([]);
+      expect(prot.not_verified).toEqual([]);
+      expect(text).not.toMatch(/NOT VERIFIED/);
+      expect(doctorOutcome(clean, prot)).toEqual({ code: 0, ok: true, headline: "doctor: OK" });
+    }
+
+    // The Linux operator cannot read the implementer's store (by design): no problem, but not verified → 3, never OK.
+    const nv = await run(asLinuxOperator);
+    expect(nv.prot.problems).toEqual([]);
+    expect(nv.prot.not_verified).toEqual([expect.stringMatching(/^isolation: unverified \(/)]);
+    expect(nv.text).toMatch(/^NOT VERIFIED from this account: isolation: unverified/m);
+    const three = doctorOutcome(clean, nv.prot);
+    expect(three).toMatchObject({ code: 3, ok: false });
+    expect(three.headline).toMatch(/^doctor: NOT VERIFIED from this account: Codex isolation \(S1\) \(no problem found/);
+    // A base problem beside it decides: 1.
+    expect(doctorOutcome({ ok: false, problems: ["x"] }, nv.prot)).toEqual({ code: 1, ok: false, headline: "doctor: 1 problem(s)" });
+
+    // A protected problem beside it decides: 1. A restart lapses the repository's records, seen by the same operator.
+    f.custodian.simulateRecoveryAfterNewBoot();
+    const pr = await run(asLinuxOperator);
+    expect(pr.prot.problems.length).toBeGreaterThan(0);
+    expect(doctorOutcome(clean, pr.prot)).toMatchObject({ code: 1, ok: false, headline: `doctor: ${pr.prot.problems.length} problem(s)` });
+    // And the base doctor still ignores the protected side.
+    expect((await cli(f, ["doctor"], asImplementer())).code).toBe(plainJson.code);
+  }, 240_000);
 });

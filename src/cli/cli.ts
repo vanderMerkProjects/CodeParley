@@ -58,8 +58,8 @@ import { runLoopCli } from "./loop-commands.js";
 import { runConfigCli, runConfigProposeCli } from "./config-commands.js";
 import { runFixCli } from "./fix-commands.js";
 import { runSetupCli } from "./setup-commands.js";
-import { doctor, protectedDoctor } from "../engine/doctor.js";
-import { renderStatus } from "./setup-commands.js";
+import { doctor, doctorExitCode, notVerifiedRecords, protectedDoctor, type ProtectedDoctorFacts } from "../engine/doctor.js";
+import { RECORD_LABEL, renderStatus } from "./setup-commands.js";
 import { fixEvidenceReader } from "./status-fix-evidence.js";
 import { ensurePrivateDataHome, gitExeOf, loadEngine } from "../engine/engine-env.js";
 import { selfOwner as ownerForDoctor } from "../store/owner.js";
@@ -594,10 +594,10 @@ async function doctorCmd(p: Parsed, io: CliIo): Promise<number> {
   if (has(p, "--repo") && !has(p, "--protected")) throw new DomainError("INVALID_ARGUMENT", "doctor --repo needs --protected");
   const repoRaw = one(p, "--repo");
   const prot = has(p, "--protected") ? await protectedDoctor(le, repoRaw ? await resolveGitTopLevel(await canonicalizePath(repoRaw), { gitExe: await gitExeOf(le) }) : null, fixEvidenceReader(le)) : null;
-  const ok = r.ok && (!prot || prot.problems.length === 0);
+  const { code, ok, headline } = doctorOutcome(r, prot);
   if (has(p, "--json")) {
     io.out(JSON.stringify(prot ? { ...r, ok, protected: prot } : r, null, 2));
-    return ok ? 0 : 1;
+    return code;
   }
   io.out(`code-parley ${r.tool_version} — node ${r.node.version} (${r.node.exec_path}), ${r.node.platform}`);
   io.out(`data home: ${r.data_home.path}${r.data_home.localappdata_fallback ? " (LOCALAPPDATA missing: USERPROFILE fallback)" : ""}${r.data_home.exists ? "" : " (not created yet)"}`);
@@ -623,7 +623,18 @@ async function doctorCmd(p: Parsed, io: CliIo): Promise<number> {
     for (const pr of prot.problems) io.out(`PROBLEM: ${pr}`);
     for (const nv of prot.not_verified) io.out(`NOT VERIFIED from this account: ${nv}`);
   }
+  io.out(headline);
+  return code;
+}
+
+/** N-4: `doctor`'s outcome. Problems → 1; with none, a required record not verified from this account → 3, whose
+ * headline says NOT VERIFIED and names the records (never "doctor: OK"); else 0. `ok` is true only for 0. */
+export function doctorOutcome(r: { ok: boolean; problems: string[] }, prot: ProtectedDoctorFacts | null): { code: 0 | 1 | 3; ok: boolean; headline: string } {
   const count = r.problems.length + (prot?.problems.length ?? 0);
-  io.out(ok ? "doctor: OK" : `doctor: ${count} problem(s)`);
-  return ok ? 0 : 1;
+  const code = doctorExitCode(r.ok ? count : Math.max(count, 1), prot?.not_verified.length ?? 0);
+  if (code === 3) {
+    const labels = notVerifiedRecords(prot!.status).map((x) => RECORD_LABEL[x.record]);
+    return { code, ok: false, headline: `doctor: NOT VERIFIED from this account: ${labels.join(", ")} (no problem found; the protected state is not established here: see the NOT VERIFIED lines)` };
+  }
+  return { code, ok: code === 0, headline: code === 0 ? "doctor: OK" : `doctor: ${count} problem(s)` };
 }

@@ -32,8 +32,8 @@ custodian is probed for at most 12 seconds.
 | Command | Exit codes |
 |---|---|
 | `status` | 0: the host is ready and, with `--repo`, so is the repository. 1: anything else |
-| `doctor` | 0: no problems. 1: problems were listed |
-| `setup` | 0: the repository is ready. 1: stopped on an error, or still not ready. 2: a step was not confirmed, or cannot run yet |
+| `doctor` | 0: no problems. 1: problems were listed. 3 (`--protected` only): no problems, but a required record could not be verified from this account; the last line says `NOT VERIFIED` and names the records. On Linux the operator's `doctor --protected` gives 3 by design: the implementer's own `doctor --protected` or `status` verifies them |
+| `setup` | 0: the repository is ready. 1: stopped on an error, or still not ready. 2: a step was not confirmed, or cannot run yet. 3: the operator's steps are complete, but this account could not verify the implementer's stored self-tests; it names the command that verifies them |
 | Other commands | 0 ok. 1 error. 2 confirmation required or not typed. 3 cancellation requested, termination not confirmed |
 | `fix reconcile` | 0: nothing to reconcile, or a choice was recorded. 3: an application waits for `--restore` or `--leave` |
 | `runs stop --close`, `--abort` | As other commands, and 4: it did not establish that no confirmed fix can run. The custodian refused, did not answer or lost its answer, or an application had already begun. The local record and the custodian's answer are printed separately. On a host with a custodian this includes an attended run it never held (`RUN_NOT_OPEN`), although the run closed locally |

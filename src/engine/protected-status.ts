@@ -18,7 +18,7 @@ import { uuidv7 } from "../common/ids.js";
 import { TOOL_VERSION } from "../common/version.js";
 import { CustodianGrants, grantListingOf } from "../custodian/grants.js";
 import { custodianPresence, protectedLoopGate } from "../custodian/protected-loops.js";
-import { CONFIG_VIEW_RUN, CUSTODIAN_PROTOCOL_VERSION, type ConfigSection, type CustodianSurface, type GrantSummary } from "../custodian/protocol.js";
+import { CONFIG_VIEW_RUN, CUSTODIAN_PROTOCOL_VERSION, type ConfigSection, type CustodianSurface, type GrantSummary, type HeldAcceptance } from "../custodian/protocol.js";
 import { CUSTODIAN_SERVICE_NAME, type CustodianPresence } from "../custodian/service-presence.js";
 import { CustodianBusy, CustodianNotTrusted, custodianClientDeadline, setCustodianClientDeadline, type CustodianTransport } from "../custodian/transport.js";
 import { runProcess } from "../process/spawn.js";
@@ -494,9 +494,16 @@ export async function repositoryRecords(o: {
 
   const allS1 = section.selftestConfirmations.filter((c) => c.mode !== "FIX");
   const revokedS1 = allS1.filter((c) => c.revoked);
-  const lapsedRow = (): RecordState =>
+  // O-11: what lapsed decides the detail and the restore; the state, required and resumable are the same for each.
+  // `unobserved`: why the stored record (and so the backend) a protected review would use could not be established.
+  const notEstablished = (unobserved: string | undefined, what: string) => (unobserved === undefined ? "" : `; ${what} was not established from this account (${unobserved})`);
+  const lapsedRow = (unobserved?: string): RecordState =>
     // A Linux S1 confirmation is bound to its boot and is never re-confirmed: a new self-test and its proposal.
-    ({ record: "isolation", state: "lapsed", required: true, detail: linux ? "the S1 self-test confirmation lapsed with the boot it was made on (it is not re-confirmed: a new self-test)" : "the S1 self-test confirmation lapsed after a restart of the OS or a rollback", restore: isolationRestore(false, true), resumable: true });
+    ({ record: "isolation", state: "lapsed", required: true, detail: `${linux ? "the S1 self-test confirmation lapsed with the boot it was made on (it is not re-confirmed: a new self-test)" : "the S1 self-test confirmation lapsed after a restart of the OS or a rollback"}${notEstablished(unobserved, "which stored self-test a protected review would use")}`, restore: isolationRestore(false, true), resumable: true });
+  // A lapsed reduced-isolation acceptance is re-confirmed with the repository's configuration by `setup --resume` (the
+  // custodian's repository re-confirmation includes lapsed acceptances), on Linux too: no new self-test is needed.
+  const lapsedAcceptanceRow = (lapsed: HeldAcceptance[], unobserved?: string): RecordState =>
+    ({ record: "isolation", state: "lapsed", required: true, detail: `the reduced-isolation (S2) acceptance ${lapsed.map((a) => `${a.acceptanceId} for ${a.backend}`).join(", ")} lapsed after a restart of the OS or a rollback (setup --resume re-confirms it with the repository's configuration)${notEstablished(unobserved, "whether a protected review would rest on it")}`, restore: resume, resumable: true });
   const ev = o.s1;
   if (ev?.ok) {
     const { decision: d, stored, codexVersion, backends } = ev.value;
@@ -527,7 +534,7 @@ export async function repositoryRecords(o: {
         out.push({ record: "isolation", state: "revoked", required: true, detail: `the confirmation of the stored S1 self-test ${recs.find((x) => revokedS1.some((c) => namesS1Record(c, x.record)))!.record.selftest_id} was revoked (setup --resume does not restore it)`, restore: confirmCmd(false, false, null), resumable: false });
       } else if (acc.some((a) => a.lapsed && heldAcceptanceApplies(a, backends, codexVersion))) {
         // A lapsed acceptance the review could rest on (the decision's own rule); an inapplicable one decides nothing.
-        out.push(lapsedRow());
+        out.push(lapsedAcceptanceRow(acc.filter((a) => a.lapsed && heldAcceptanceApplies(a, backends, codexVersion))));
       } else if (usableOrLapsed.length || acc.length) {
         // A historical confirmation exists, but not for the record a protected review would use (F-S71-2).
         out.push({ record: "isolation", state: "unconfirmed", required: true, detail: `${usableOrLapsed.some((c) => c.usable) ? "a usable S1 confirmation is held, but " : ""}${s1Why}: a protected review is refused (CODEX_ISOLATION_UNAVAILABLE) until the operator confirms the stored one`, restore: confirmCmd(false, true, reason === "record_changed" ? null : (backends[0] ?? "")), resumable: true, reason });
@@ -542,7 +549,8 @@ export async function repositoryRecords(o: {
   } else if (s1.some((c) => c.lapsed) || (!revokedS1.length && acc.some((a) => a.lapsed))) {
     // Not observed, so which record or backend a lapse concerns is unknown: an unrevoked S1 confirmation that lapsed is
     // resumable; a lapsed acceptance counts only when no S1 confirmation was revoked (a revocation is never masked).
-    out.push(lapsedRow());
+    const unobserved = ev && !ev.ok ? ev.why : "the stored self-test was not compared";
+    out.push(s1.some((c) => c.lapsed) ? lapsedRow(unobserved) : lapsedAcceptanceRow(acc.filter((a) => a.lapsed), unobserved));
   } else if (revokedS1.length || section.acceptances.some((a) => a.revoked)) {
     out.push({ record: "isolation", state: "revoked", required: true, detail: "every S1 self-test confirmation (or acceptance) was revoked (setup --resume does not restore it)", restore: isolationRestore(false, false), resumable: false });
   } else out.push({ record: "isolation", state: "missing", required: true, detail: "no S1 self-test confirmation (or reduced-isolation acceptance) is in force", restore: isolationRestore(false, false), resumable: false });
