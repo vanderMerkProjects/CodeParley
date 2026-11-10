@@ -157,13 +157,28 @@ $version = Read-Host 'Version, from the TD acceptance record'
 $commit  = Read-Host 'Source commit (40 hex), from the TD acceptance record'
 $digest  = Read-Host 'Manifest SHA-256 (64 hex), from the TD acceptance record'
 $pkg     = Read-Host 'The signing package directory'
-git -C $clone fetch origin
-git -C $clone -c "gpg.program=$gpg" verify-commit $commit       # a good signature by the commit key 261E3060…2B25
-git -C $clone checkout --detach $commit
+if ($commit -cnotmatch '^[0-9a-f]{40}$') { throw 'STOP: the source commit must be its full 40-character id' }
+git -C $clone fetch origin; if ($LASTEXITCODE -ne 0) { throw 'STOP: the fetch failed' }
+$sig = @(git -C $clone -c "gpg.program=$gpg" verify-commit --raw $commit 2>&1 | ForEach-Object { "$_" }); $verified = $LASTEXITCODE -eq 0
+$valid = @($sig | Where-Object { $_ -match '^\[GNUPG:\] VALIDSIG ' })
+if (-not $verified -or @($sig | Where-Object { $_ -match '^\[GNUPG:\] GOODSIG ' }).Count -ne 1 -or $valid.Count -ne 1 -or $valid[0] -cnotmatch ' 261E3060E70B4904615F17BD026A2C3E92B42B25$') { throw 'STOP: the source commit is not signed by the commit key 261E3060E70B4904615F17BD026A2C3E92B42B25' }
+git -C $clone checkout --detach $commit; if ($LASTEXITCODE -ne 0) { throw 'STOP: the checkout failed' }
+if ((git -C $clone rev-parse HEAD) -cne $commit -or (git -C $clone status --porcelain --untracked-files=all)) { throw 'STOP: the checkout is not exactly the accepted commit' }
 git -C $clone merge-base --is-ancestor $commit origin/main; if ($LASTEXITCODE -ne 0) { throw 'STOP: the source commit is not in main' }
 $v = @('--dir', $pkg, '--version', $version, '--commit', $commit, '--manifest-sha256', $digest, '--gpg', $gpg, '--repo', $clone)
-node "$clone\scripts\package\verify-release.mjs" package @v
+node "$clone\scripts\package\verify-release.mjs" package @v; if ($LASTEXITCODE -ne 0) { throw 'STOP: the package does not verify' }
 ```
+
+Each step stops at its first failure, and no code from the clone runs before the source commit's identity is
+established.
+- **The fetch:** a failed fetch stops.
+- **The signature:** your own Gpg4win and keyring verify the commit's signature. The check stops unless there is exactly
+  one good signature whose primary key, the last field of `VALIDSIG`, is the commit key `261E3060…2B25`. A bad signature,
+  a missing one, an unknown key or another signer stops before the checkout.
+- **The checkout:** a failed checkout stops, and so does a checked-out `HEAD` that is not exactly the typed commit,
+  including a working tree with changes.
+- **The verifier:** only then does `verify-release.mjs package` run, from that checkout, with the full release-source
+  check below. If it fails, nothing is signed.
 
 **The source commit is not `main`'s head.** It is the owner-signed head of the milestone pull request, which GitHub
 merged into `main` with a merge commit of its own, signed by GitHub and not by the owner. That merge is never a

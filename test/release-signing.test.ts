@@ -961,8 +961,27 @@ describe("Step 4: the release tooling has no signing or publication side effects
       return i;
     };
     // The typed values, the fetch, the owner's own GnuPG check of the commit, its checkout, then the verifier from it.
-    const order = ["Read-Host 'Source commit", "fetch origin", "verify-commit $commit", "checkout --detach $commit", "merge-base --is-ancestor $commit origin/main", 'verify-release.mjs" package'];
+    const order = ["Read-Host 'Source commit", "fetch origin", "verify-commit --raw $commit", "checkout --detach $commit", "merge-base --is-ancestor $commit origin/main", 'verify-release.mjs" package'];
     for (let i = 1; i < order.length; i++) expect(at(order[i - 1]!), `${order[i - 1]} before ${order[i]}`).toBeLessThan(at(order[i]!));
+  });
+
+  it("TD C-1 correction: every step of the owner's source check stops on failure, before any code from the clone runs", () => {
+    const doc = readFileSync(join(root, "docs", "releasing.md"), "utf8");
+    const sign = doc.slice(doc.indexOf("### 4. Sign (owner)"), doc.indexOf("### 5. Publish"));
+    const block = sign.slice(sign.indexOf("```powershell"), sign.indexOf("```", sign.indexOf("```powershell") + 3));
+    const line = (s: string) => block.split("\n").find((l) => l.includes(s)) ?? "";
+    // Each git step and the verifier carry their own stop on the same line.
+    for (const step of ["fetch origin", "checkout --detach $commit", "merge-base --is-ancestor", 'verify-release.mjs" package']) expect(line(step), step).toMatch(/; if \(\$LASTEXITCODE -ne 0\) \{ throw 'STOP: [^']+' \}$/);
+    expect(line("-cnotmatch '^[0-9a-f]{40}$'")).toContain("throw 'STOP:");
+    // The signature: the owner's own Git and Gpg4win, one GOODSIG, one VALIDSIG whose primary is the pinned commit key.
+    expect(block).toContain('verify-commit --raw $commit 2>&1');
+    expect(block).toContain("'^\\[GNUPG:\\] GOODSIG '");
+    expect(block).toContain("$valid.Count -ne 1 -or $valid[0] -cnotmatch ' 261E3060E70B4904615F17BD026A2C3E92B42B25$'");
+    expect(block).toContain("throw 'STOP: the source commit is not signed by the commit key 261E3060E70B4904615F17BD026A2C3E92B42B25'");
+    expect(block).toMatch(/\(git -C \$clone rev-parse HEAD\) -cne \$commit -or \(git -C \$clone status --porcelain --untracked-files=all\)\) \{ throw 'STOP: /);
+    // The verifier, code from the clone, comes last.
+    expect(block.indexOf("verify-release.mjs")).toBeGreaterThan(block.indexOf("rev-parse HEAD"));
+    expect(block.match(/\$clone\\scripts/g)).toHaveLength(1);
   });
 
   it("D-107 C-1: staging checks the source's integration before it builds anything, and refuses on any problem", () => {
