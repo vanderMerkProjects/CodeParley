@@ -320,7 +320,7 @@ internal sealed partial class GrantLedger
         => AtomicWrite(ProposalPath(repoKey, runId, operationId), "{\"schema\":\"" + FixProposalContentSchema + "\",\"orphan\":true}");
 
     /// <summary>TEST only (the shared corpus, POST-1 Fix Withdraw W18): a deletion this returns true for fails as an I/O error.</summary>
-    internal static Func<string, bool>? DeleteFaultForTest;
+    internal static Func<string, bool>? DeleteFaultForTest { get; set; }
 
     /// <summary>Remove the proposal files retired under the gate. Called only OUTSIDE the gate. A file that cannot be removed
     /// stays (audited); it is retired in its record, so nothing offers or applies it, and the orphan sweep removes it later.</summary>

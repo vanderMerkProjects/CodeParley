@@ -23,7 +23,7 @@ export const FIX_WITHDRAW_NOT_INTERACTIVE =
   "A delegated fix's confirmation is withdrawn only at an interactive terminal, with the word typed by you: run this command yourself in a terminal (stdin and stdout must be a terminal; there is no flag that skips this). Nothing was recorded.";
 
 export const FIX_WITHDRAW_OLD_CUSTODIAN =
-  "This custodian predates `fix withdraw`. Ending the run (`code-parley runs stop <run-id> --close --repo <path>`) retires its confirmed fixes, and everything else in the run. Or upgrade the custodian. Nothing was recorded.";
+  "This custodian predates `fix withdraw`. Ending the run (`code-parley runs stop RUN_ID --close --repo REPO_PATH`) retires its confirmed fixes, and everything else in the run. Or upgrade the custodian. Nothing was recorded.";
 
 /** The outcome of one withdrawal attempt: recorded, already withdrawn (the end state holds; nothing written), not recorded
  * (cancelled or refused), or unknown (the commit's answer was lost). */
@@ -92,7 +92,7 @@ async function withdrawOnce(transport: CustodianTransport, io: CliIo, prompt: (q
     out = await commitFixWithdrawal(transport, prepared.authorizationRequestId);
   } catch (e) {
     if (deliveryOutcomeOf(e) === "unknown") {
-      io.err("The custodian's answer was lost after the withdrawal was sent: CodeParley does not know whether it was recorded and does not send it again. Check with `code-parley fix show <run-id> <proposal> --repo <path>` or `code-parley fix review`.");
+      io.err("The custodian's answer was lost after the withdrawal was sent: CodeParley does not know whether it was recorded and does not send it again. Check with `code-parley fix show RUN_ID FIX_ID --repo REPO_PATH` or `code-parley fix review`.");
       return "unknown";
     }
     if (!isDomainError(e)) throw e;

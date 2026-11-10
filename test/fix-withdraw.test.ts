@@ -145,6 +145,7 @@ describe.skipIf(!supported)("POST-1 Fix Withdraw: fix withdraw and fix review (s
     const commits = sent(f, "commit");
     expect(await withdraw(f, run, op, io)).toBe(4);
     expect(io.errors.join("\n")).toMatch(/answer was lost after the withdrawal was sent: CodeParley does not know whether it was recorded and does not send it again/);
+    expect(io.errors.join("\n")).toContain("Check with `code-parley fix show RUN_ID FIX_ID --repo REPO_PATH` or `code-parley fix review`.");
     expect(sent(f, "commit")).toBe(commits + 1);
     // The custodian did record it (the connection broke after): fix show reports it.
     await expect(applyFix(f.le, run, { proposal_id: op })).rejects.toThrow(/CONFIRMATION_WITHDRAWN|withdrew/);
@@ -156,7 +157,7 @@ describe.skipIf(!supported)("POST-1 Fix Withdraw: fix withdraw and fix review (s
     const commits = sent(f, "commit");
     const io = terminal(script());
     expect(await withdraw(f, run, op, io, old)).toBe(2);
-    expect(io.errors.join("\n")).toContain("This custodian predates `fix withdraw`. Ending the run");
+    expect(io.errors.join("\n")).toContain("This custodian predates `fix withdraw`. Ending the run (`code-parley runs stop RUN_ID --close --repo REPO_PATH`)");
     expect(sent(f, "commit")).toBe(commits);
     expect(io.questions).toEqual([]);
   });
