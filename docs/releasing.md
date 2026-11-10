@@ -25,7 +25,9 @@ What each stage trusts:
 - **Sign and publish** trust only:
   - the version, source commit and manifest SHA-256 that **the owner types from the TD's acceptance record**;
   - the release key pinned in `scripts/package/lib/release-verify.mjs` and in the source commit's
-    `docs/codeparley-release-key.asc`;
+    `docs/codeparley-release-key.asc`, and the commit key pinned there;
+  - the object graph of the fetched `origin/main`, which must integrate the source commit through its pull request's
+    GitHub merge (step 4);
   - what the verifier recomputes.
 
   The verifier runs from a fresh clone, not from the build machine. It checks signatures in a temporary GnuPG home
@@ -126,9 +128,13 @@ node scripts/package/stage-release.mjs --node-win <node.exe> --node-linux <node>
 node scripts/package/prepare-signing.mjs --staged <staged> --out <package> --version <v> --commit <commit> --manifest-sha256 <digest> --gpg 'C:\Program Files\GnuPG\bin\gpg.exe'
 ```
 
+A release candidate is staged only after its pull request is merged: `stage-release.mjs` refuses to stage one (with
+`--allow-dirty` too) unless the checked-out commit is integrated into the fetched `origin/main`, as checked at step 4
+below. Before the merge, `--test-version` stages test builds for qualification; they are never release candidates.
+
 `prepare-signing.mjs` checks:
-- **The commit:** signed by the commit key; `package.json` at that version; pinning the release key with the current
-  subkey, unexpired.
+- **The commit:** signed by the pinned commit key; integrated into the fetched `origin/main` (step 4); `package.json`
+  at that version; pinning the release key with the current subkey, unexpired.
 - **The manifest:** the accepted digest; the version and commit; a clean build of a verified commit; unsigned; each
   artifact once, in order.
 - **Every artifact:** size; SHA-256; and the BUILD-ID inside the archive or beside it, which must equal the
@@ -147,16 +153,39 @@ Close every Claude Code and Codex session and open PowerShell 7 outside the Clau
 $gpg = 'C:\Program Files\GnuPG\bin\gpg.exe'
 $s = Get-AuthenticodeSignature $gpg; if ($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notmatch 'CN=g10 Code GmbH') { throw 'STOP: not Gpg4win' }
 $clone = Read-Host 'A fresh clone of https://github.com/vanderMerkProjects/CodeParley'
-git -C $clone fetch origin
-git -C $clone checkout --detach origin/main
-git -C $clone -c "gpg.program=$gpg" verify-commit HEAD          # a good signature by the commit key 261E3060…2B25
 $version = Read-Host 'Version, from the TD acceptance record'
 $commit  = Read-Host 'Source commit (40 hex), from the TD acceptance record'
 $digest  = Read-Host 'Manifest SHA-256 (64 hex), from the TD acceptance record'
 $pkg     = Read-Host 'The signing package directory'
+git -C $clone fetch origin
+git -C $clone -c "gpg.program=$gpg" verify-commit $commit       # a good signature by the commit key 261E3060…2B25
+git -C $clone checkout --detach $commit
+git -C $clone merge-base --is-ancestor $commit origin/main; if ($LASTEXITCODE -ne 0) { throw 'STOP: the source commit is not in main' }
 $v = @('--dir', $pkg, '--version', $version, '--commit', $commit, '--manifest-sha256', $digest, '--gpg', $gpg, '--repo', $clone)
 node "$clone\scripts\package\verify-release.mjs" package @v
 ```
+
+**The source commit is not `main`'s head.** It is the owner-signed head of the milestone pull request, which GitHub
+merged into `main` with a merge commit of its own, signed by GitHub and not by the owner. That merge is never a
+release source. So the owner checks the accepted commit itself, with their own GnuPG, before running any code from
+it, and the verifier then runs from that verified checkout. Its `package` step also checks how the commit reached
+`main`, against the fetched `origin/main` (`integrationOf` in `scripts/package/lib/release-verify.mjs`), from Git
+objects only (object IDs, parents and trees; no branch name or label):
+
+- the commit is signed by the commit key pinned in `release-verify.mjs` (`COMMIT_KEY`), whatever key file the commit
+  itself carries;
+- it is reachable from `origin/main`;
+- exactly one commit on `main`'s first-parent line merges it: a merge committed by GitHub, with exactly two parents,
+  the second being the source commit;
+- that merge's tree is the source commit's tree, so `main` received exactly the released bytes;
+- the commit is not on that line itself (it was merged, not pushed or fast-forwarded);
+- if `main` has moved on since, it did so only through GitHub merges, so the integrating merge stays on its
+  first-parent history.
+
+GitHub's own signature on the merge is not verified, as in CI's identity check: the release rests on the owner's
+signature on the source and on this object graph. Missing, ambiguous or contradictory evidence fails, a shallow clone
+and replacement refs included. Every record holds the integrating merge it found, so a later fetch of a `main` that no
+longer integrates the commit makes the records stale, while `main` moving on through later merges does not.
 
 Insert the YubiKey. Check that `--card-status` lists the signature key `EFD68E18…E6C9`. Then sign, re-checking the
 manifest's hash in the same command:
@@ -241,11 +270,13 @@ Stop. Do not edit, re-stage or re-sign around it. The step's `verified-<step>.js
 
 ## Rehearsal
 
-- **Staging:** `stage-release.mjs --test-version <v>-rehearsal.<n>` stages a test build from a clean, signed commit.
+- **Staging:** `stage-release.mjs --test-version <v>-rehearsal.<n>` stages a test build from a clean, signed commit,
+  which need not be integrated into `main` yet.
 - **`--rehearsal`,** on both scripts:
   - accepts only such a build;
   - marks the package and every record as a rehearsal;
-  - checks `package.json` against the version before the suffix.
+  - checks `package.json` against the version before the suffix;
+  - does not check the integration into `main`, since a rehearsal is never a release.
 - **Signing:** a rehearsal package is signed only with a disposable test key, and the verifier then reports that the
   signature is not the release key's, as it should.
 - **Tests:** `test/release-signing.test.ts` runs the whole procedure with disposable keys, including expiry, rotation

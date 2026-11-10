@@ -10,7 +10,9 @@
 //
 // Checks, all fail-closed: the accepted manifest digest; the manifest and every BUILD-ID (version, commit, a clean build
 // of a verified commit, one toolchain); every artifact's size, SHA-256 and carried BUILD-ID; nothing else in the staged
-// directory; the commit signed by the owner's commit key and carrying the version; the release key the commit pins,
+// directory; the commit signed by the owner's pinned commit key and carrying the version; unless --rehearsal, the
+// commit integrated into the clone's fetched main by the GitHub merge whose second parent it is, with its tree
+// (lib/release-verify.mjs integrationOf; C-1); the release key the commit pins,
 // with the CURRENT approved signing subkey in it, unexpired and unrevoked (the request names that subkey).
 // Repeating the command with the same inputs leaves a complete package as it is (also after the owner signed it); a
 // package that differs is refused, never overwritten. An interrupted run leaves only a `<out>.partial-*` directory,
@@ -22,8 +24,9 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameS
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  MANIFEST, PUBLIC_REPO, RELEASE_KEY, REQUEST, REQUEST_SCHEMA, SIGNATURE, canonical, commitProblems, currentSubkey,
-  defaultGpg, expectationProblems, fileAt, git, listKeys, packageCheck, releaseKeyProblems, sidecarOf, tagName, withKeyring,
+  COMMIT_KEY, MANIFEST, PUBLIC_REPO, RELEASE_KEY, REQUEST, REQUEST_SCHEMA, SIGNATURE, canonical, currentSubkey,
+  defaultGpg, expectationProblems, fileAt, git, listKeys, packageCheck, releaseKeyProblems, releaseSourceProblems, sidecarOf,
+  tagName, withKeyring,
 } from "./lib/release-verify.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -96,14 +99,16 @@ Nothing here has been signed.
 `;
 }
 
-export function prepare(argv, { pins = RELEASE_KEY, repo = REPO, log = (s) => process.stdout.write(s), now } = {}) {
+export function prepare(argv, { pins = RELEASE_KEY, commitPin = COMMIT_KEY.primary, repo = REPO, log = (s) => process.stdout.write(s), now } = {}) {
   const o = parse(argv);
   const gpg = o.gpg ?? defaultGpg();
   const problems = [];
   if (inside(o.out, repo)) problems.push(`--out ${o.out} is inside the repository: the signing package lives outside it`);
   if (inside(o.out, o.staged) || inside(o.staged, o.out)) problems.push("--out and --staged must be separate directories");
   if (!existsSync(o.staged)) problems.push(`--staged ${o.staged} does not exist`);
-  problems.push(...commitProblems({ repo, commit: o.commit, version: o.version, gpg, pins, rehearsal: o.rehearsal }));
+  // C-1: the source commit and, unless a rehearsal, its integration into the fetched main (lib/release-verify.mjs).
+  const source = releaseSourceProblems({ repo, commit: o.commit, version: o.version, gpg, pins, commitPin, rehearsal: o.rehearsal });
+  problems.push(...source.problems);
   try {
     const key = fileAt(repo, o.commit, RELEASE_KEY.file);
     problems.push(...withKeyring(gpg, [key], (kr) => releaseKeyProblems(listKeys(kr), pins, { forSigning: true, ...(now ? { now } : {}) })));
@@ -144,7 +149,7 @@ export function prepare(argv, { pins = RELEASE_KEY, repo = REPO, log = (s) => pr
   } finally {
     rmSync(part, { recursive: true, force: true });
   }
-  log(`prepared ${o.rehearsal ? "a REHEARSAL " : ""}signing package: ${o.out}\n  version ${o.version}, commit ${o.commit}\n  manifest SHA-256 ${want.manifest.sha256}\n  signing subkey ${want.releaseKey.signingSubkey}\n  next: the owner follows docs/releasing.md in a verified clone; SIGNING-REQUEST.md is only for comparison\n`);
+  log(`prepared ${o.rehearsal ? "a REHEARSAL " : ""}signing package: ${o.out}\n  version ${o.version}, commit ${o.commit}\n  ${source.integration ? `integrated into main by the GitHub merge ${source.integration.merge}` : "a rehearsal: no integration into main required"}\n  manifest SHA-256 ${want.manifest.sha256}\n  signing subkey ${want.releaseKey.signingSubkey}\n  next: the owner follows docs/releasing.md in a verified clone; SIGNING-REQUEST.md is only for comparison\n`);
   return 0;
 }
 

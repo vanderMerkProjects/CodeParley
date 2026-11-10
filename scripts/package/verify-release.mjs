@@ -9,7 +9,9 @@
 //   node scripts/package/verify-release.mjs <step> --dir <signing package> --version <v> --commit <sha>
 //        --manifest-sha256 <accepted digest> [--repo <clone>] [--gpg <gpg>] [--rehearsal] [--published]
 //
-//   package    the commit (signed by the commit key, carrying the version, pinning the release key), the manifest's
+//   package    the commit (signed by the pinned commit key, carrying the version, pinning the release key) and, unless
+//              --rehearsal, its integration into the clone's fetched main (the GitHub merge whose second parent it is,
+//              with its tree, on main's first-parent line: lib/release-verify.mjs integrationOf); the manifest's
 //              digest and content, every artifact's size, SHA-256 and BUILD-ID, nothing unexpected in the package
 //   signature  package, then release-manifest.json.asc: one good signature by an approved release signing subkey (the
 //              one the request names), or one of a key expired since, inside the subkey's validity
@@ -28,9 +30,9 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  KEY_FILE, MANIFEST, PUBLIC_REPO, RECORD_SCHEMA, RELEASE_KEY, REMOTE_SOURCE, REQUEST, SIGNATURE, STEPS, approvedSubkeys,
-  canonical, commitProblems, defaultGpg, expectationProblems, fileAt, git, gpgVersion, listKeys, packageCheck, payloadFiles,
-  releaseKeyProblems, releaseState, remoteReleaseProblems, sha256, tagName, tagProblems, verifyDetached, withKeyring,
+  COMMIT_KEY, KEY_FILE, MAIN_REF, MANIFEST, PUBLIC_REPO, RECORD_SCHEMA, RELEASE_KEY, REMOTE_SOURCE, REQUEST, SIGNATURE, STEPS,
+  approvedSubkeys, canonical, defaultGpg, expectationProblems, fileAt, git, gpgVersion, listKeys, packageCheck, payloadFiles,
+  releaseKeyProblems, releaseSourceProblems, releaseState, remoteReleaseProblems, sha256, tagName, tagProblems, verifyDetached, withKeyring,
 } from "./lib/release-verify.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -71,14 +73,18 @@ const argsOf = (o) => ({ version: o.version, commit: o.commit, manifestSha256: o
 
 /** The checks of each step, cumulative: a later step re-runs the earlier ones, so no step trusts an old record. */
 function checks(o, ctx) {
-  const { pins, gpg, repo, github, repoPin } = ctx;
+  const { pins, gpg, repo, github, repoPin, commitPin } = ctx;
   const details = {};
   const problems = [];
   const expect = { version: o.version, commit: o.commit, manifestSha256: o.manifestSha256, rehearsal: o.rehearsal };
   const order = STEPS.indexOf(o.step);
 
-  // package
-  problems.push(...commitProblems({ repo, commit: o.commit, version: o.version, gpg, pins, rehearsal: o.rehearsal }));
+  // package: the source commit, and (C-1) how it reached main; a rehearsal is never a release, so it needs no integration
+  const source = releaseSourceProblems({ repo, commit: o.commit, version: o.version, gpg, pins, commitPin, rehearsal: o.rehearsal });
+  problems.push(...source.problems);
+  details.releaseSource = source.integration
+    ? { required: true, mainRef: MAIN_REF, main: source.integration.main, merge: source.integration.merge, tree: source.integration.tree }
+    : { required: false };
   let keyArmored = null;
   try {
     keyArmored = fileAt(repo, o.commit, RELEASE_KEY.file);
@@ -173,7 +179,7 @@ ${files.map((f) => `- \`${f.name}\`: ${f.size} bytes, SHA-256 \`${f.sha256}\``).
 
 /** Each step's standing now: { status: PASS | FAIL | not verified, why, record }. */
 function standing(o, ctx) {
-  const now = releaseState(o.dir, ctx.repo, o.version);
+  const now = releaseState(o.dir, ctx.repo, o.version, o.commit);
   const out = {};
   for (const s of STEPS) {
     const path = join(o.dir, record(s));
@@ -216,6 +222,7 @@ function report(o, ctx, log) {
   const sig = st.signature.status === "PASS" ? st.signature.record.details.signature : null;
   const tag = st.tag.status === "PASS" ? st.tag.record.details.tag : null;
   const remote = st.remote.status === "PASS" ? st.remote.record.details.remote : null;
+  const source = st.package.status === "PASS" ? st.package.record.details.releaseSource : null;
   const md = `# CodeParley ${o.version}: release verification report${o.rehearsal ? " (REHEARSAL)" : ""}
 
 **${verdict(st)}.**
@@ -224,6 +231,7 @@ function report(o, ctx, log) {
 |---|---|
 | Version | \`${o.version}\` |
 | Source commit | \`${o.commit}\` |
+| Integrated into main by | ${source?.merge ? `the GitHub merge \`${source.merge}\` (its second parent is the source; the same tree)` : source?.required === false ? "not required (rehearsal: never a release)" : "not verified"} |
 | Manifest SHA-256 | \`${o.manifestSha256}\` |
 | Signature | ${sig ? `SHA-256 \`${sig.sha256}\`${sig.keyExpiredSince ? " (the signing key has expired since)" : ""}` : "not verified"} |
 | Tag | ${tag ? `\`${tag.name}\`, tag object \`${tag.object}\`` : "not verified"} |
@@ -241,9 +249,9 @@ only while that state is unchanged and only for the version, commit, manifest di
   return 0;
 }
 
-export function verify(argv, { pins = RELEASE_KEY, repoPin = PUBLIC_REPO, github = githubApi, log = (s) => process.stdout.write(s) } = {}) {
+export function verify(argv, { pins = RELEASE_KEY, commitPin = COMMIT_KEY.primary, repoPin = PUBLIC_REPO, github = githubApi, log = (s) => process.stdout.write(s) } = {}) {
   const o = parse(argv);
-  const ctx = { pins, repoPin, github, gpg: o.gpg ?? defaultGpg(), repo: o.repo ?? REPO };
+  const ctx = { pins, commitPin, repoPin, github, gpg: o.gpg ?? defaultGpg(), repo: o.repo ?? REPO };
   if (o.step === "report") return report(o, ctx, log);
   const at = join(o.dir, record(o.step));
   if (existsSync(o.dir)) rmSync(at, { force: true });
@@ -255,7 +263,7 @@ export function verify(argv, { pins = RELEASE_KEY, repoPin = PUBLIC_REPO, github
     problems = [`the verification stopped with an error: ${e instanceof Error ? e.message : String(e)}`];
   }
   let state = null;
-  try { state = releaseState(o.dir, ctx.repo, o.version)[o.step]; } catch (e) { problems.push(`the release state cannot be read: ${e instanceof Error ? e.message : String(e)}`); }
+  try { state = releaseState(o.dir, ctx.repo, o.version, o.commit)[o.step]; } catch (e) { problems.push(`the release state cannot be read: ${e instanceof Error ? e.message : String(e)}`); }
   const rec = {
     schema: RECORD_SCHEMA,
     step: o.step,
@@ -273,6 +281,8 @@ export function verify(argv, { pins = RELEASE_KEY, repoPin = PUBLIC_REPO, github
     return 1;
   }
   log(`verify-release ${o.step}: PASS${o.rehearsal ? " (REHEARSAL)" : ""}\n  ${o.version} at ${o.commit}\n  manifest SHA-256 ${o.manifestSha256}\n  release key ${pins.primary} / signing subkey ${details.signingSubkey}\n`);
+  const src = details.releaseSource;
+  log(src?.merge ? `  integrated into ${src.mainRef} (${src.main}) by the GitHub merge ${src.merge}: second parent the source, the same tree ${src.tree}\n` : "  integration into main: not required (rehearsal: never a release)\n");
   if (details.signature) log(`  signature SHA-256 ${details.signature.sha256}${details.signature.keyExpiredSince ? " (good, by a key that has expired since; inside its validity)" : ""}\n`);
   if (details.tag) log(`  tag ${details.tag.name}, object ${details.tag.object}, tagger ${details.tag.tagger}\n`);
   if (o.step === "payload") log(`  payload: ${details.payload.length} files (release-payload.json); next: docs/releasing.md, "5. Publish"\n`);
