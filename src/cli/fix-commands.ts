@@ -36,7 +36,7 @@ import { loadEngine, type Loaded, type RunHandle } from "../engine/engine-env.js
 import { resolveRunRef } from "../engine/run-admin.js";
 import { reconcileApplications } from "../engine/fix-apply.js";
 import { commitFixDecision, prepareFixDecision } from "../engine/fix-decision.js";
-import { fixRenderingOf, fixRunSectionOf, type FixRunRef } from "../engine/fix-view.js";
+import { fixesOf, fixRenderingOf, fixRunSectionOf, type FixRunRef } from "../engine/fix-view.js";
 import { repoRoot } from "./loop-commands.js";
 import { runFixReview } from "./fix-review.js";
 import { runFixWithdraw } from "./fix-withdraw.js";
@@ -115,7 +115,21 @@ export async function runFixCli(a: FixArgs, io: CliIo): Promise<number> {
 
 async function show(le: Loaded, run: FixRunRef, proposal: string | null, io: CliIo): Promise<number> {
   if (proposal) {
-    const r = await fixRenderingOf(le, run, proposal);
+    let r: Awaited<ReturnType<typeof fixRenderingOf>>;
+    try {
+      r = await fixRenderingOf(le, run, proposal);
+    } catch (e) {
+      // A retired proposal (withdrawn, expired, its run ended) is no longer rendered: the custodian keeps the fix's
+      // record, not its content. Show that record (its status and the owner's decision) instead of the refusal, so a
+      // withdrawal can be checked here, as `fix withdraw` says after a lost answer. Anything else stays an error.
+      if (!isDomainError(e) || e.code !== "EVIDENCE_NOT_HELD") throw e;
+      const held = (await fixesOf(le, run))?.find((x) => x.proposal_id === proposal);
+      if (!held?.proposal?.retired) throw e;
+      const d = held.owner_decision;
+      io.out(`delegated fix ${held.proposal_id}: ${held.status}${d ? ` (owner ${d.decision === "confirm" ? "confirmed" : "rejected"}${d.withdrawn_at ? `, withdrawn at ${d.withdrawn_at}` : d.consumed_by ? `, applied by ${d.consumed_by}` : ""})` : ""}`);
+      io.out(`Its proposal was retired (${held.proposal.retired}): the custodian keeps the fix's record, not its content, so it renders nothing.`);
+      return 0;
+    }
     io.out(`delegated fix ${r.operationId}: ${r.status}${r.confirmation ? ` (owner ${r.confirmation.decision === "confirm" ? "confirmed" : "rejected"}${r.confirmation.withdrawnAt ? `, withdrawn at ${r.confirmation.withdrawnAt}` : r.confirmation.consumedAt ? `, applied from at ${r.confirmation.consumedAt}` : r.confirmation.expiresAt ? `, confirmation expires ${r.confirmation.expiresAt}` : ""})` : ""}`);
     io.out("The custodian's rendering (verbatim):");
     for (const line of r.rendering.replace(/\n$/, "").split("\n")) io.out(line);

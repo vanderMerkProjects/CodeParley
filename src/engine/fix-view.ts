@@ -57,7 +57,7 @@ export interface FixSummary {
 }
 
 /** The run's delegated fixes as the custodian holds them (no content), for get_review_status. Null: not a protected run. */
-export async function fixesOf(le: Loaded, run: RunHandle): Promise<FixSummary[] | null> {
+export async function fixesOf(le: Loaded, run: FixRunRef): Promise<FixSummary[] | null> {
   const ops = ((await fixRunSectionOf(le, run)).run?.record as { operations?: Record<string, unknown>[] } | null)?.operations ?? null;
   if (ops === null) return null;
   const applies = ops.filter((o) => o["kind"] === "apply");

@@ -147,8 +147,27 @@ describe.skipIf(!supported)("POST-1 Fix Withdraw: fix withdraw and fix review (s
     expect(io.errors.join("\n")).toMatch(/answer was lost after the withdrawal was sent: CodeParley does not know whether it was recorded and does not send it again/);
     expect(io.errors.join("\n")).toContain("Check with `code-parley fix show RUN_ID FIX_ID --repo REPO_PATH` or `code-parley fix review`.");
     expect(sent(f, "commit")).toBe(commits + 1);
-    // The custodian did record it (the connection broke after): fix show reports it.
+    // The custodian did record it (the connection broke after): the named check, fix show, reports it.
     await expect(applyFix(f.le, run, { proposal_id: op })).rejects.toThrow(/CONFIRMATION_WITHDRAWN|withdrew/);
+    const check = terminal(script());
+    expect(await cli(f, ["fix", "show", run.runId, op, "--repo", f.repo], check), check.errors.join(" | ")).toBe(0);
+    expect(check.lines.join("\n")).toMatch(/\(owner confirmed, withdrawn at [^)]+\)/);
+  });
+
+  it("PR #9 review (Codex): after a withdrawal, `fix show RUN_ID FIX_ID --repo` shows it from the run record, since the retired proposal is no longer rendered", async () => {
+    const { f, run, op } = await confirmed();
+    expect(await withdraw(f, run, op, terminal(script("withdraw")))).toBe(0);
+    // The custodian no longer renders the retired proposal: that refusal stands.
+    expect(await f.custodian.send("operator", "render_fix_proposal", { repositoryRoot: f.repo, runId: run.runId, operationId: op }, "render-retired")).toMatchObject({ ok: false, code: "EVIDENCE_NOT_HELD" });
+    const io = terminal(script());
+    expect(await cli(f, ["fix", "show", run.runId, op, "--repo", f.repo], io), io.errors.join(" | ")).toBe(0);
+    const out = io.lines.join("\n");
+    expect(out).toMatch(new RegExp(`^delegated fix ${op}: \\S+ \\(owner confirmed, withdrawn at \\d{4}-\\d\\d-\\d\\dT[^)]+\\)$`, "m"));
+    expect(out).toContain("Its proposal was retired (withdrawn): the custodian keeps the fix's record, not its content, so it renders nothing.");
+    expect(out).not.toContain("The custodian's rendering (verbatim):");
+    // A fix the custodian does not hold is still an error.
+    const missing = terminal(script());
+    expect(await cli(f, ["fix", "show", run.runId, "0".repeat(32), "--repo", f.repo], missing)).not.toBe(0);
   });
 
   it("an older custodian (UNKNOWN_OPERATION): the run-end recovery is named, exit 2, nothing recorded", async () => {
