@@ -34,8 +34,8 @@ clean commit whose signature verified).
 ## The 1.0.0 release
 
 CodeParley 1.0.0 was released privately. Its binaries are kept in the project's private archive and are **not**
-published here. The first public binary release is planned as 1.0.1, built from this repository, with its own
-manifest and signatures. For the record, the 1.0.0 release is:
+published here. The first public binary release was 1.0.1, built from this repository, with its own manifest and
+signatures. For the record, the 1.0.0 release is:
 
 | | |
 |---|---|
