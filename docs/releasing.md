@@ -228,7 +228,39 @@ Then remove the YubiKey.
 ```powershell
 node "$clone\scripts\package\verify-release.mjs" payload @v     # adds the release key; lists the twelve files
 gh api repos/vanderMerkProjects/CodeParley --jq .id              # must print 1443307878
-git -C $clone push origin "refs/tags/v$version"
+```
+
+**The tag push and the `no-tags` ruleset.** The repository's `no-tags` ruleset (`26443668`) blocks creating, updating
+and deleting every tag, with no standing bypass, so a plain push of the tag is rejected ("Cannot create ref due to
+creations being restricted"). Only the owner adds and removes the bypass and pushes the tag, for this one push:
+- save the ruleset first;
+- add the Organization admin bypass;
+- push only `refs/tags/v<version>`;
+- remove the bypass at once, even if the push failed;
+- compare the ruleset with the saved copy: active, the same rules and conditions, no bypass actors.
+
+Then check that GitHub's tag is the verified tag object. A pushed tag is never moved. The bypass can also be added and
+removed on the ruleset's settings page instead of through the API.
+
+```powershell
+$tagObj = git -C $clone rev-parse "refs/tags/v$version"          # the tag object verify-release tag checked
+$rs = 'repos/vanderMerkProjects/CodeParley/rulesets/26443668'
+$before = gh api $rs | ConvertFrom-Json
+if ($before.bypass_actors.Count -ne 0 -or $before.enforcement -ne 'active') { throw 'STOP: no-tags is not in its expected state' }
+$on  = Join-Path $env:TEMP 'no-tags-bypass.json';  [IO.File]::WriteAllText($on,  '{"bypass_actors":[{"actor_id":1,"actor_type":"OrganizationAdmin","bypass_mode":"always"}]}')
+$off = Join-Path $env:TEMP 'no-tags-restore.json'; [IO.File]::WriteAllText($off, '{"bypass_actors":[]}')
+gh api -X PUT $rs --input $on | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'STOP: could not add the bypass (nothing changed)' }
+$pushed = $false
+try { git -C $clone push origin "refs/tags/v$version"; $pushed = $LASTEXITCODE -eq 0 } finally { gh api -X PUT $rs --input $off | Out-Null }
+$after = gh api $rs | ConvertFrom-Json
+if ($after.bypass_actors.Count -ne 0 -or $after.enforcement -ne 'active' -or (($after.rules.type | Sort-Object) -join ',') -ne 'creation,deletion,update' -or ($after.conditions | ConvertTo-Json -Compress -Depth 5) -ne ($before.conditions | ConvertTo-Json -Compress -Depth 5)) { throw 'STOP: no-tags is NOT restored: remove the bypass on its settings page now' }
+if (-not $pushed) { throw 'STOP: the tag push failed (no-tags is restored)' }
+if ((gh api "repos/vanderMerkProjects/CodeParley/git/ref/tags/v$version" --jq '.object.sha') -cne $tagObj) { throw "STOP: GitHub's tag is not the verified tag object; do not move it" }
+```
+
+Then the draft:
+
+```powershell
 $files = (Get-Content -Raw "$pkg\release-payload.json" | ConvertFrom-Json).files | ForEach-Object { Join-Path $pkg $_.name }
 gh release create "v$version" --repo vanderMerkProjects/CodeParley --draft --verify-tag --title "CodeParley $version" --notes-file "$pkg\RELEASE-NOTES.md" @files
 node "$clone\scripts\package\verify-release.mjs" remote @v      # GitHub-REPORTED sizes and digests of the draft

@@ -984,6 +984,26 @@ describe("Step 4: the release tooling has no signing or publication side effects
     expect(block.match(/\$clone\\scripts/g)).toHaveLength(1);
   });
 
+  it("P-2: the owner's tag push opens no-tags only around the push, restores it even on failure, and checks both", () => {
+    const doc = readFileSync(join(root, "docs", "releasing.md"), "utf8");
+    const publish = doc.slice(doc.indexOf("### 5. Publish"), doc.indexOf("## When a check fails"));
+    const at = (s: string) => {
+      const i = publish.indexOf(s);
+      expect(i, s).toBeGreaterThan(-1);
+      return i;
+    };
+    expect(publish).toContain("Only the owner adds and removes the bypass and pushes the tag");
+    // The one push of the tag sits inside a try whose finally removes the bypass.
+    expect(publish.match(/push origin "refs\/tags\/v\$version"/g)).toHaveLength(1);
+    expect(publish).toContain('try { git -C $clone push origin "refs/tags/v$version"; $pushed = $LASTEXITCODE -eq 0 } finally { gh api -X PUT $rs --input $off | Out-Null }');
+    expect(publish).toContain(`'{"bypass_actors":[]}'`);
+    // Saved before, bypass added, pushed, restored, compared with the saved copy, then GitHub's tag checked; the draft after.
+    const order = ["$before = gh api $rs", "--input $on", "try { git -C $clone push", "$after = gh api $rs", "STOP: no-tags is NOT restored", "STOP: the tag push failed", "git/ref/tags/v$version", "gh release create"];
+    for (let i = 1; i < order.length; i++) expect(at(order[i - 1]!), `${order[i - 1]} before ${order[i]}`).toBeLessThan(at(order[i]!));
+    expect(publish).toContain("$after.bypass_actors.Count -ne 0 -or $after.enforcement -ne 'active'");
+    expect(publish).toContain("($after.conditions | ConvertTo-Json -Compress -Depth 5) -ne ($before.conditions | ConvertTo-Json -Compress -Depth 5)");
+  });
+
   it("D-107 C-1: staging checks the source's integration before it builds anything, and refuses on any problem", () => {
     const s = code("scripts/package/stage-release.mjs");
     const gate = s.indexOf("stagingSourceGate(");
