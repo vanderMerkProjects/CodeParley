@@ -993,15 +993,19 @@ describe("Step 4: the release tooling has no signing or publication side effects
       return i;
     };
     expect(publish).toContain("Only the owner adds and removes the bypass and pushes the tag");
-    // The one push of the tag sits inside a try whose finally removes the bypass.
+    // Adding the bypass and the one push of the tag both sit inside a try whose finally removes the bypass, so an
+    // add whose response was lost is still undone.
     expect(publish.match(/push origin "refs\/tags\/v\$version"/g)).toHaveLength(1);
-    expect(publish).toContain('try { git -C $clone push origin "refs/tags/v$version"; $pushed = $LASTEXITCODE -eq 0 } finally { gh api -X PUT $rs --input $off | Out-Null }');
+    expect(publish.match(/--input \$on/g)).toHaveLength(1);
     expect(publish).toContain(`'{"bypass_actors":[]}'`);
+    expect(publish).toContain("} finally { gh api -X PUT $rs --input $off | Out-Null;");
+    expect(publish).not.toMatch(/'no-tags-(bypass|restore)\.json'/);
     // Saved before, bypass added, pushed, restored, compared with the saved copy, then GitHub's tag checked; the draft after.
-    const order = ["$before = gh api $rs", "--input $on", "try { git -C $clone push", "$after = gh api $rs", "STOP: no-tags is NOT restored", "STOP: the tag push failed", "git/ref/tags/v$version", "gh release create"];
+    const order = ["$before = gh api $rs", "try {", "gh api -X PUT $rs --input $on", 'git -C $clone push origin "refs/tags/v$version"', "} finally { gh api -X PUT $rs --input $off", "$after = gh api $rs", "STOP: no-tags is NOT restored", "STOP: adding the bypass failed", "STOP: the tag push failed", "git/ref/tags/v$version", "gh release create"];
     for (let i = 1; i < order.length; i++) expect(at(order[i - 1]!), `${order[i - 1]} before ${order[i]}`).toBeLessThan(at(order[i]!));
-    expect(publish).toContain("$after.bypass_actors.Count -ne 0 -or $after.enforcement -ne 'active'");
-    expect(publish).toContain("($after.conditions | ConvertTo-Json -Compress -Depth 5) -ne ($before.conditions | ConvertTo-Json -Compress -Depth 5)");
+    // The restored ruleset is compared whole with the saved copy, rules included, not only by rule type.
+    expect(publish).toContain("$after.bypass_actors.Count -ne 0");
+    for (const p of ["name", "target", "enforcement", "conditions", "rules"]) expect(publish).toContain(`(& $same '${p}')`);
   });
 
   it("D-107 C-1: staging checks the source's integration before it builds anything, and refuses on any problem", () => {
