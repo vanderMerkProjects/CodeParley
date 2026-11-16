@@ -248,7 +248,7 @@ removed on the ruleset's settings page instead of through the API.
 $tagObj = git -C $clone rev-parse "refs/tags/v$version"          # the tag object verify-release tag checked
 $rs = 'repos/vanderMerkProjects/CodeParley/rulesets/26443668'
 $before = gh api $rs | ConvertFrom-Json
-if ($before.bypass_actors.Count -ne 0 -or $before.enforcement -ne 'active' -or (($before.rules.type | Sort-Object) -join ',') -ne 'creation,deletion,update') { throw 'STOP: no-tags is not in its expected state' }
+if ($before.bypass_actors.Count -ne 0 -or $before.enforcement -ne 'active' -or $before.target -ne 'tag' -or (($before.rules.type | Sort-Object) -join ',') -ne 'creation,deletion,update') { throw 'STOP: no-tags is not in its expected state' }
 $id  = [guid]::NewGuid()
 $on  = Join-Path $env:TEMP "no-tags-bypass-$id.json";  [IO.File]::WriteAllText($on,  '{"bypass_actors":[{"actor_id":1,"actor_type":"OrganizationAdmin","bypass_mode":"always"}]}')
 $off = Join-Path $env:TEMP "no-tags-restore-$id.json"; [IO.File]::WriteAllText($off, '{"bypass_actors":[]}')

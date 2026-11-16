@@ -1004,6 +1004,7 @@ describe("Step 4: the release tooling has no signing or publication side effects
     const order = ["$before = gh api $rs", "try {", "gh api -X PUT $rs --input $on", 'git -C $clone push origin "refs/tags/v$version"', "} finally { gh api -X PUT $rs --input $off", "$after = gh api $rs", "STOP: no-tags is NOT restored", "STOP: adding the bypass failed", "STOP: the tag push failed", "git/ref/tags/v$version", "gh release create"];
     for (let i = 1; i < order.length; i++) expect(at(order[i - 1]!), `${order[i - 1]} before ${order[i]}`).toBeLessThan(at(order[i]!));
     // The restored ruleset is compared whole with the saved copy, rules included, not only by rule type.
+    expect(publish).toContain("$before.target -ne 'tag'");
     expect(publish).toContain("$after.bypass_actors.Count -ne 0");
     for (const p of ["name", "target", "enforcement", "conditions", "rules"]) expect(publish).toContain(`(& $same '${p}')`);
   });
